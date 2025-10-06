@@ -12,6 +12,30 @@ pip install -e .
 
 You can also create a normal install with `pip install .` if you prefer a non-editable install.
 
+## Configuration
+
+Before running the tool, you need to configure the LLM API key. You can do this in two ways:
+
+### Option 1: Environment Variable (recommended for command-line usage)
+
+```powershell
+$env:LLM_API_KEY = "your-api-key-here"
+```
+
+### Option 2: Programmatic Configuration (recommended for notebook usage)
+
+In your notebook or script, call the `set_api_key` function:
+
+```python
+from institution_checker import set_api_key
+
+set_api_key("your-api-key-here")
+```
+
+This is particularly useful when working in notebooks where setting environment variables may be inconvenient.
+
+The application will raise an error if the API key is not configured through either method.
+
 ## Command-line usage
 
 Run the CLI entry point:

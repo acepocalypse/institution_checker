@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from .config import LLM_API_KEY, LLM_API_URL, MODEL_NAME
+from .config import get_api_key, LLM_API_URL, MODEL_NAME
 
 _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
@@ -473,7 +473,7 @@ async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.1) 
     """Call LLM without max_tokens limit - let thinking model use what it needs."""
     session = await get_session()
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {get_api_key()}",
         "Content-Type": "application/json",
     }
     payload = {

@@ -18,7 +18,7 @@ Usage examples:
 from .main import run_pipeline  # noqa: F401
 from .search import close_search_clients  # noqa: F401
 from .llm_processor import close_session  # noqa: F401
-from .config import INSTITUTION  # noqa: F401
+from .config import INSTITUTION, set_api_key  # noqa: F401
 
 # Re-export notebook-friendly utilities
 from .nb_utils import (  # noqa: F401
@@ -35,6 +35,7 @@ __all__ = [
     "close_search_clients",
     "close_session",
     "INSTITUTION",
+    "set_api_key",
     # utils
     "FileSourceContext",
     "clean_names",
