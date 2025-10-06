@@ -23,6 +23,7 @@ PROMPT_TEMPLATE = """Analyze if this person has an official connection to the in
 
 Person: {name}
 Institution: {institution}
+Current date: {current_date}
 Current year: {current_year}
 
 Search results:
@@ -41,7 +42,7 @@ NOT valid:
 Current vs Past classification:
 - CURRENT: Active employment NOW (use present tense indicators: "is", "currently", "works at")
 - PAST: Former employment (use past tense indicators: "was", "former", "retired", "emeritus", date ranges that ended)
-- Check dates carefully: 2015-2020 is PAST, 2023-present is CURRENT
+- Check dates carefully: 2015-2024 is PAST, 2025-present is CURRENT
 
 Instructions:
 1. Return ONLY a JSON object
