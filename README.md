@@ -1,0 +1,143 @@
+# Institution Checker
+
+Python package for verifying whether people have connections to a target institution using web search heuristics and an LLM.
+
+## Installation
+
+Recommended for development (editable):
+
+```powershell
+pip install -e .
+```
+
+You can also create a normal install with `pip install .` if you prefer a non-editable install.
+
+## Command-line usage
+
+Run the CLI entry point:
+
+```powershell
+institution-checker --input=data/input_names.csv
+```
+
+Or run as a module:
+
+```powershell
+python -m institution_checker --input=data/input_names.csv
+```
+
+For compatibility with older workflows you can still call the script directly:
+
+```powershell
+python main.py --input=data/input_names.csv
+```
+
+## Notebook usage
+
+This repository includes `quick_runner_notebook.ipynb` — a minimal notebook to run the pipeline interactively. Below are three practical ways to use the library from a notebook located in any directory.
+
+1) Editable install (recommended during development)
+
+	- From PowerShell in the project root:
+
+	```powershell
+	pip install -e .
+	```
+
+	- In a notebook cell you can ensure the kernel environment has the editable install:
+
+	```python
+	# In a Jupyter cell
+	%pip install -e "C:\\Users\\setiawa\\Documents\\institution_checker"
+	from institution_checker import run_pipeline, resolve_names, INSTITUTION
+	```
+
+	Editable install makes local code changes immediately importable.
+
+2) Add `src` to sys.path at runtime (no install required)
+
+	- Useful for quick one-off runs if you don't want to install the package. Add a small cell at the top of your notebook:
+
+	```python
+	import sys
+	from pathlib import Path
+
+	repo_root = Path(r"C:\\Users\\setiawa\\Documents\\institution_checker")
+	src_path = repo_root / "src"
+	if str(src_path) not in sys.path:
+		 sys.path.insert(0, str(src_path))
+
+	from institution_checker import run_pipeline, resolve_names, INSTITUTION
+	```
+
+	- This makes `institution_checker` importable without installing.
+
+3) Regular pip install (for stable environments)
+
+	- Install normally into the environment used by your notebook:
+
+	```powershell
+	pip install .
+	```
+
+Async function usage in notebooks
+
+- Many functions in this project are async (for example `run_pipeline`). In Jupyter you can usually `await` at top-level in a cell:
+
+```python
+names = ["Jane Doe"]
+results = await run_pipeline(names, batch_size=1)
+```
+
+- If your kernel does not support top-level `await`, wrap calls:
+
+```python
+import asyncio
+
+async def _call():
+	 return await run_pipeline(names, batch_size=1)
+
+results = asyncio.run(_call())
+```
+
+- If you get "This event loop is already running" when using `asyncio.run`, use the notebook-friendly option (prefer `await`) or install `nest_asyncio` and apply it before `asyncio.run`:
+
+```python
+import nest_asyncio
+nest_asyncio.apply()
+```
+
+Running the Quick Runner notebook
+
+- Open `quick_runner_notebook.ipynb` in JupyterLab / Jupyter Notebook.
+- Top cells contain imports and configuration (INPUT_MODE, NAME_LIST, etc.).
+- There is a "Reload" cell that reloads the package if you made local edits — run it after changing source files.
+- The notebook includes sections to:
+  - Configure inputs
+  - Resolve names
+  - Reload module (for dev)
+  - Run the pipeline (async)
+  - Diagnose LLM output
+  - Re-run failed names and export results
+
+Troubleshooting
+
+- ImportError: If importing `institution_checker` fails, verify either the editable install succeeded or the `src` path is added to `sys.path`. Inside a notebook, run `import sys; print(sys.executable)` and `%pip list` to confirm the environment.
+- Kernel environment mismatch: Use `%pip install -e` inside the notebook to ensure the package installs into the notebook kernel's Python.
+- Event loop errors: prefer top-level `await` in Jupyter. If you must use `asyncio.run` and the kernel already has a running loop, use `nest_asyncio`.
+- Module caching: after editing source, reload with:
+
+```python
+import importlib, institution_checker as ic
+importlib.reload(ic)
+```
+
+If you want, the notebook can add `src` to `sys.path` automatically on load — see `quick_runner_notebook.ipynb` for an example cell.
+
+## Contributing
+
+Please file issues or pull requests for problems or improvements.
+
+---
+
+If you'd like, I can insert a convenience cell at the top of `quick_runner_notebook.ipynb` that automatically ensures `src` is on `sys.path` and prints the resolved import path — say the word "insert" and I'll add it.

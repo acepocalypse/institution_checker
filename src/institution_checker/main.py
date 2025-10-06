@@ -1,0 +1,557 @@
+import asyncio
+import os
+import sys
+import time
+from typing import Any, Dict, List
+
+import pandas as pd
+
+from .config import INSTITUTION
+from .llm_processor import analyze_connection, close_session, refresh_session
+from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources
+
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_INPUT_PATH = "data/input_names.csv"
+RESULTS_PATH = "data/results.csv"
+PARTIAL_RESULTS_PATH = "data/results_partial.csv"
+INTER_BATCH_DELAY = 2.5  # seconds between batches to prevent rate limiting
+NAME_TIMEOUT = 240.0  # maximum time allowed per name before failing
+MAX_CONCURRENT_LLM_CALLS = 4  # limit concurrent LLM API calls to avoid overwhelming the API
+
+
+class NameProcessingTimeout(Exception):
+    """Raised when processing a single name exceeds the allowed timeout."""
+
+    def __init__(self, name: str, timeout: float = NAME_TIMEOUT):
+        super().__init__(f"Timed out processing '{name}' after {timeout:.0f}s")
+        self.name = name
+        self.timeout = timeout
+
+
+def load_names(path: str) -> List[str]:
+    if not os.path.exists(path):
+        return []
+    data = pd.read_csv(path)
+    if "name" not in data.columns:
+        raise ValueError('CSV file must contain a "name" column')
+    return [
+        str(value).strip()
+        for value in data["name"].dropna()
+        if str(value).strip()
+    ]
+
+
+def _ensure_parent_dir(path: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
+async def process_name_search(name: str, use_enhanced_search: bool, debug: bool = False) -> tuple[str, List[Dict[str, Any]]]:
+    """Phase 1: Perform search for a name and return results."""
+    search_start = time.time()
+    
+    print(f"[PROGRESS] Starting search for: {name}")
+    
+    try:
+        # Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
+        if use_enhanced_search:
+            # Try basic search first (faster, less redundant)
+            query = f'"{name}" "{INSTITUTION}"'
+            print(f"[PROGRESS] Trying basic search first for efficiency...")
+            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+            
+            # Evaluate if we need enhanced search
+            # Check for high-quality results with strong signals
+            high_quality_count = sum(
+                1 for r in results 
+                if r.get('signals', {}).get('relevance_score', 0) >= 10
+            )
+            
+            # Escalate to enhanced search if:
+            # - Less than 8 total results, OR
+            # - Less than 3 high-quality results (to ensure thorough checking)
+            needs_enhanced = len(results) < 8 or high_quality_count < 3
+            
+            if needs_enhanced:
+                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
+                results = await enhanced_search(name, INSTITUTION, num_results=20, debug=debug)
+            else:
+                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
+            
+            # Final fallback if still no results
+            if not results:
+                print(f"[WARN] No results from either search method")
+        else:
+            query = f'"{name}" {INSTITUTION}'
+            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+        
+        search_elapsed = time.time() - search_start
+        print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
+        
+        if not results:
+            print(f"[WARN] No search results found for {name}")
+        
+        return name, results
+        
+    except Exception as e:
+        elapsed = time.time() - search_start
+        print(f"[ERROR] Search failed for {name} after {elapsed:.1f}s: {e}")
+        raise
+
+
+async def process_name_llm(name: str, results: List[Dict[str, Any]], debug: bool = False) -> Dict[str, str]:
+    """Phase 2: Analyze search results with LLM."""
+    llm_start = time.time()
+    print(f"[PROGRESS] Starting LLM analysis for: {name}")
+    
+    try:
+        decision = await analyze_connection(name, INSTITUTION, results, debug=debug)
+        llm_elapsed = time.time() - llm_start
+        print(f"[PROGRESS] LLM analysis completed for {name} in {llm_elapsed:.1f}s")
+        
+        payload = {"name": name, "institution": INSTITUTION}
+        payload.update(decision)
+        return payload
+        
+    except Exception as e:
+        elapsed = time.time() - llm_start
+        print(f"[ERROR] LLM analysis failed for {name} after {elapsed:.1f}s: {e}")
+        raise
+
+
+async def process_name(name: str, use_enhanced_search: bool, debug: bool = False) -> Dict[str, str]:
+    """Process a name with focused error handling - rely on component-level robustness.
+    
+    This is kept for backward compatibility and simple single-name processing.
+    For batch processing, use the split phase approach in process_batch().
+    """
+    search_start = time.time()
+    
+    print(f"[PROGRESS] Starting search for: {name}")
+    
+    try:
+        # Step 1: Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
+        if use_enhanced_search:
+            # Try basic search first (faster, less redundant)
+            query = f'"{name}" "{INSTITUTION}"'
+            print(f"[PROGRESS] Trying basic search first for efficiency...")
+            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+            
+            # Evaluate if we need enhanced search
+            # Check for high-quality results with strong signals
+            high_quality_count = sum(
+                1 for r in results 
+                if r.get('signals', {}).get('relevance_score', 0) >= 10
+            )
+            
+            # Escalate to enhanced search if:
+            # - Less than 8 total results, OR
+            # - Less than 3 high-quality results (to ensure thorough checking)
+            needs_enhanced = len(results) < 8 or high_quality_count < 3
+            
+            if needs_enhanced:
+                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
+                results = await enhanced_search(name, INSTITUTION, num_results=20, debug=debug)
+            else:
+                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
+            
+            # Final fallback if still no results
+            if not results:
+                print(f"[WARN] No results from either search method")
+        else:
+            query = f'"{name}" {INSTITUTION}'
+            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+        
+        search_elapsed = time.time() - search_start
+        print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
+        
+        if not results:
+            print(f"[WARN] No search results found for {name}")
+        
+        # Step 2: LLM Analysis
+        llm_start = time.time()
+        print(f"[PROGRESS] Starting LLM analysis for: {name}")
+        decision = await analyze_connection(name, INSTITUTION, results, debug=debug)
+        llm_elapsed = time.time() - llm_start
+        print(f"[PROGRESS] LLM analysis completed for {name} in {llm_elapsed:.1f}s")
+        
+        payload = {"name": name, "institution": INSTITUTION}
+        payload.update(decision)
+        return payload
+        
+    except Exception as e:
+        elapsed = time.time() - search_start
+        print(f"[ERROR] Failed to process {name} after {elapsed:.1f}s: {e}")
+        raise
+
+
+async def _process_name_with_timeout(name: str, use_enhanced_search: bool, debug: bool = False) -> Dict[str, str]:
+    async def _run(selected_enhanced: bool) -> Dict[str, str]:
+        return await asyncio.wait_for(
+            process_name(name, selected_enhanced, debug=debug),
+            timeout=NAME_TIMEOUT,
+        )
+
+    try:
+        return await _run(use_enhanced_search)
+    except asyncio.TimeoutError as exc:  # pragma: no cover - guarded by runtime behaviour
+        if use_enhanced_search:
+            print(f"[WARN] {name}: enhanced search timed out after {NAME_TIMEOUT:.0f}s, retrying with basic search...")
+            try:
+                return await _run(False)
+            except asyncio.TimeoutError as fallback_exc:  # pragma: no cover - guarded by runtime behaviour
+                raise NameProcessingTimeout(name, NAME_TIMEOUT) from fallback_exc
+        raise NameProcessingTimeout(name, NAME_TIMEOUT) from exc
+
+
+def print_result_summary(result: Dict[str, str]) -> None:
+    name = result.get("name", "")
+    connected = result.get("connected", "N")
+    if connected == "Y":
+        detail = result.get("connection_detail", "")
+        status = result.get("current_or_past", "N/A")
+        confidence = result.get("confidence", "medium")
+        print(f"[OK] {name}: connected ({status}, {confidence}) - {detail}")
+    else:
+        print(f"[--] {name}: no confirmed connection to {INSTITUTION}")
+
+
+def build_error_result(name: str, error: Exception) -> Dict[str, str]:
+    message = str(error)
+    return {
+        "name": name,
+        "institution": INSTITUTION,
+        "connected": "N",
+        "connection_detail": f"Error: {message}",
+        "current_or_past": "N/A",
+        "supporting_url": "",
+        "confidence": "low",
+        "temporal_evidence": f"Processing error: {message}",
+    }
+
+
+def has_error(result: Dict[str, str]) -> bool:
+    """Check if a result contains an error in any field."""
+    # Check for explicit error markers
+    for field in ["temporal_evidence", "connection_detail"]:
+        value = str(result.get(field, ""))
+        # Only flag as error if it starts with "Error:" or contains "Processing error:"
+        if value.startswith("Error:") or "Processing error:" in value:
+            return True
+    
+    # Additional check: if confidence is missing or connection_detail is suspiciously short for a valid response
+    confidence = result.get("confidence", "").strip()
+    connection_detail = result.get("connection_detail", "").strip()
+    
+    # If confidence is missing or empty, it's likely malformed
+    if not confidence or confidence not in ["high", "medium", "low"]:
+        return True
+    
+    # If connection_detail is too short (less than 10 chars) and not a clear "no connection" response
+    if len(connection_detail) < 10 and result.get("connected") == "Y":
+        return True
+    
+    return False
+
+
+def merge_results(original: List[Dict[str, str]], retried: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Merge retried results back into original, replacing failed records."""
+    retry_lookup = {r["name"]: r for r in retried}
+    merged = []
+    for record in original:
+        name = record.get("name", "")
+        if name in retry_lookup:
+            merged.append(retry_lookup[name])
+        else:
+            merged.append(record)
+    return merged
+
+
+async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool = False) -> List[Dict[str, str]]:
+    """Process a batch of names with parallel search and LLM phases for optimal performance."""
+    print(f"[BATCH] Processing {len(names)} names: {', '.join(names)}")
+    batch_start = time.time()
+
+    # ===== PHASE 1: Search (all in parallel) =====
+    print(f"[BATCH] Phase 1: Running searches in parallel for all {len(names)} names")
+    search_phase_start = time.time()
+    
+    search_coroutines = [
+        asyncio.wait_for(
+            process_name_search(name, use_enhanced_search, debug=debug),
+            timeout=NAME_TIMEOUT
+        )
+        for name in names
+    ]
+    search_outcomes = await asyncio.gather(*search_coroutines, return_exceptions=True)
+    
+    search_phase_elapsed = time.time() - search_phase_start
+    print(f"[BATCH] Phase 1 completed in {search_phase_elapsed:.1f}s")
+    
+    # Process search results
+    search_results: Dict[str, List[Dict[str, Any]]] = {}
+    failed_searches: Dict[str, Exception] = {}
+    
+    for name, outcome in zip(names, search_outcomes):
+        if isinstance(outcome, Exception):
+            print(f"[BATCH] Search failed for {name}: {outcome}")
+            failed_searches[name] = outcome
+            search_results[name] = []  # Empty results for failed searches
+        else:
+            result_name, results = outcome
+            search_results[result_name] = results
+            print(f"[BATCH] Search succeeded for {name}: {len(results)} results")
+    
+    # ===== PHASE 2: LLM Analysis (all in parallel with concurrency limit) =====
+    print(f"[BATCH] Phase 2: Running LLM analysis in parallel for all {len(names)} names (max {MAX_CONCURRENT_LLM_CALLS} concurrent)")
+    llm_phase_start = time.time()
+    
+    # Create semaphore to limit concurrent LLM calls
+    llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+    
+    async def llm_with_semaphore(name: str, results: List[Dict[str, Any]]) -> Dict[str, str]:
+        async with llm_semaphore:
+            return await asyncio.wait_for(
+                process_name_llm(name, results, debug=debug),
+                timeout=NAME_TIMEOUT
+            )
+    
+    llm_coroutines = [
+        llm_with_semaphore(name, search_results.get(name, []))
+        for name in names
+    ]
+    llm_outcomes = await asyncio.gather(*llm_coroutines, return_exceptions=True)
+    
+    llm_phase_elapsed = time.time() - llm_phase_start
+    print(f"[BATCH] Phase 2 completed in {llm_phase_elapsed:.1f}s")
+    
+    # ===== Combine results =====
+    ordered_results: List[Dict[str, str]] = []
+    completed_count = 0
+    
+    for name, llm_outcome in zip(names, llm_outcomes):
+        completed_count += 1
+        elapsed = time.time() - batch_start
+        
+        # Check if search failed first
+        if name in failed_searches:
+            print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) - search error")
+            result = build_error_result(name, failed_searches[name])
+        elif isinstance(llm_outcome, Exception):
+            if isinstance(llm_outcome, asyncio.TimeoutError):
+                print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
+                result = build_error_result(name, NameProcessingTimeout(name, NAME_TIMEOUT))
+            else:
+                print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: {llm_outcome}")
+                result = build_error_result(name, llm_outcome)
+        else:
+            print(f"[BATCH] Completed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
+            result = llm_outcome
+            print_result_summary(result)
+        
+        ordered_results.append(result)
+    
+    batch_elapsed = time.time() - batch_start
+    print(f"[BATCH] Batch completed in {batch_elapsed:.1f}s (search: {search_phase_elapsed:.1f}s, LLM: {llm_phase_elapsed:.1f}s)")
+    return ordered_results
+
+
+def write_partial_results(results: List[Dict[str, str]]) -> None:
+    if not results:
+        return
+    _ensure_parent_dir(PARTIAL_RESULTS_PATH)
+    pd.DataFrame(results).to_csv(PARTIAL_RESULTS_PATH, index=False)
+
+
+def save_final_results(results: List[Dict[str, str]]) -> None:
+    if not results:
+        return
+    _ensure_parent_dir(RESULTS_PATH)
+    pd.DataFrame(results).to_csv(RESULTS_PATH, index=False)
+    print(f"[INFO] Results saved to {RESULTS_PATH}")
+
+
+async def run_pipeline(names: List[str], batch_size: int, use_enhanced_search: bool, inter_batch_delay: float = INTER_BATCH_DELAY, debug: bool = False) -> List[Dict[str, str]]:
+    total = len(names)
+    batches = [names[i:i + batch_size] for i in range(0, total, batch_size)]
+    search_label = "enhanced" if use_enhanced_search else "basic"
+    print(f"[PIPELINE] Starting: {total} name(s) in {len(batches)} batch(es) using {search_label} search")
+    print(f"[PIPELINE] Batch size: {batch_size}, Inter-batch delay: {inter_batch_delay}s")
+    
+    all_results: List[Dict[str, str]] = []
+    start_time = time.time()
+
+    for index, batch in enumerate(batches, 1):
+        print(f"\n[PIPELINE] ===== BATCH {index}/{len(batches)} =====")
+        print(f"[PIPELINE] Names in this batch: {batch}")
+        batch_start = time.time()
+        
+        try:
+            batch_results = await process_batch(batch, use_enhanced_search, debug=debug)
+            all_results.extend(batch_results)
+            batch_elapsed = time.time() - batch_start
+            pipeline_elapsed = time.time() - start_time
+            
+            print(f"[PIPELINE] Batch {index} completed in {batch_elapsed:.1f}s")
+            print(f"[PIPELINE] Total pipeline time so far: {pipeline_elapsed:.1f}s")
+            print(f"[PIPELINE] Total results collected: {len(all_results)}")
+            
+            write_partial_results(all_results)
+            print(f"[PIPELINE] Partial results written to {PARTIAL_RESULTS_PATH}")
+            
+        except Exception as e:
+            batch_elapsed = time.time() - batch_start
+            print(f"[ERROR] Batch {index} failed after {batch_elapsed:.1f}s: {e}")
+            # Add error results for all names in failed batch
+            for name in batch:
+                all_results.append(build_error_result(name, e))
+        
+        # Clean up resources between batches to prevent performance degradation
+        if index < len(batches):  # Don't cleanup after the last batch
+            print(f"[PIPELINE] Starting cleanup and {inter_batch_delay}s delay before batch {index + 1}...")
+            cleanup_start = time.time()
+            
+            try:
+                await cleanup_batch_resources()
+                await refresh_session()  # Also refresh LLM session
+                cleanup_elapsed = time.time() - cleanup_start
+                print(f"[PIPELINE] Cleanup completed in {cleanup_elapsed:.1f}s")
+                
+                print(f"[PIPELINE] Waiting {inter_batch_delay}s before next batch...")
+                await asyncio.sleep(inter_batch_delay)
+                print(f"[PIPELINE] Ready to start batch {index + 1}")
+                
+            except Exception as e:
+                cleanup_elapsed = time.time() - cleanup_start
+                print(f"[WARN] Cleanup failed after {cleanup_elapsed:.1f}s: {e}")
+
+    # Check for failed records and retry them
+    failed_results = [r for r in all_results if has_error(r)]
+    if failed_results:
+        failed_names = [r["name"] for r in failed_results]
+        print(f"\n[PIPELINE] ===== RETRY PHASE =====")
+        print(f"[PIPELINE] Found {len(failed_names)} failed record(s), retrying...")
+        print(f"[PIPELINE] Failed names: {', '.join(failed_names)}")
+        
+        retry_start = time.time()
+        try:
+            # Retry with smaller batches for better reliability
+            retry_batch_size = max(1, batch_size // 2)
+            retry_batches = [failed_names[i:i + retry_batch_size] for i in range(0, len(failed_names), retry_batch_size)]
+            
+            retry_results: List[Dict[str, str]] = []
+            for retry_index, retry_batch in enumerate(retry_batches, 1):
+                print(f"[RETRY] Processing batch {retry_index}/{len(retry_batches)}: {retry_batch}")
+                retry_batch_results = await process_batch(retry_batch, use_enhanced_search, debug=debug)
+                retry_results.extend(retry_batch_results)
+                
+                if retry_index < len(retry_batches):
+                    print(f"[RETRY] Waiting {inter_batch_delay}s before next retry batch...")
+                    await asyncio.sleep(inter_batch_delay)
+            
+            # Merge retry results back into all_results
+            all_results = merge_results(all_results, retry_results)
+            retry_elapsed = time.time() - retry_start
+            
+            # Check how many are still failing
+            still_failed = [r for r in all_results if has_error(r)]
+            successful_retries = len(failed_names) - len(still_failed)
+            
+            print(f"[RETRY] Retry phase completed in {retry_elapsed:.1f}s")
+            print(f"[RETRY] Successfully recovered {successful_retries}/{len(failed_names)} record(s)")
+            if still_failed:
+                print(f"[RETRY] {len(still_failed)} record(s) still have errors")
+            
+            write_partial_results(all_results)
+            
+        except Exception as e:
+            retry_elapsed = time.time() - retry_start
+            print(f"[ERROR] Retry phase failed after {retry_elapsed:.1f}s: {e}")
+
+    total_elapsed = time.time() - start_time
+    avg = total_elapsed / total if total else 0.0
+    print(f"\n[PIPELINE] ===== COMPLETED =====")
+    print(f"[PIPELINE] Total time: {total_elapsed:.1f}s")
+    print(f"[PIPELINE] Average per name: {avg:.1f}s")
+    print(f"[PIPELINE] Total results: {len(all_results)}")
+    
+    # Final error summary
+    final_errors = [r for r in all_results if has_error(r)]
+    if final_errors:
+        print(f"[PIPELINE] Warning: {len(final_errors)} record(s) completed with errors")
+    else:
+        print(f"[PIPELINE] All records processed successfully")
+    
+    return all_results
+
+
+async def main_async(debug: bool, batch_size: int, use_enhanced_search: bool, input_path: str, inter_batch_delay: float) -> None:
+    try:
+        names = load_names(input_path)
+    except Exception as error:
+        print(f"[ERROR] Failed to load names: {error}")
+        return
+
+    if not names:
+        fallback = input("Enter a name to evaluate: ").strip()
+        if not fallback:
+            print("[INFO] No names provided. Exiting.")
+            return
+        names = [fallback]
+
+    print(f"[INFO] Target institution: {INSTITUTION}")
+    print(f"[INFO] Batch size: {batch_size}")
+    if len([names[i:i + batch_size] for i in range(0, len(names), batch_size)]) > 1:
+        print(f"[INFO] Inter-batch delay: {inter_batch_delay}s")
+
+    results = await run_pipeline(names, batch_size, use_enhanced_search, inter_batch_delay, debug=debug)
+    save_final_results(results)
+
+
+def parse_cli(argv: List[str]):
+    debug = "--debug" in argv
+    use_enhanced = "--basic" not in argv and "--basic-search" not in argv
+    batch_size = DEFAULT_BATCH_SIZE
+    input_path = DEFAULT_INPUT_PATH
+    inter_batch_delay = INTER_BATCH_DELAY
+
+    for arg in argv:
+        if arg.startswith("--batch-size="):
+            value = arg.split("=", 1)[1]
+            try:
+                batch_size = max(1, min(int(value), 50))
+            except ValueError:
+                print(f"[WARN] Invalid batch size '{value}', using default {DEFAULT_BATCH_SIZE}")
+                batch_size = DEFAULT_BATCH_SIZE
+        elif arg.startswith("--input="):
+            value = arg.split("=", 1)[1]
+            if value:
+                input_path = value
+        elif arg.startswith("--batch-delay="):
+            value = arg.split("=", 1)[1]
+            try:
+                inter_batch_delay = max(0.0, float(value))
+            except ValueError:
+                print(f"[WARN] Invalid batch delay '{value}', using default {INTER_BATCH_DELAY}")
+                inter_batch_delay = INTER_BATCH_DELAY
+
+    return debug, batch_size, use_enhanced, input_path, inter_batch_delay
+
+
+def main() -> None:
+    debug, batch_size, use_enhanced_search, input_path, inter_batch_delay = parse_cli(sys.argv[1:])
+
+    async def runner():
+        try:
+            await main_async(debug, batch_size, use_enhanced_search, input_path, inter_batch_delay)
+        finally:
+            await close_search_clients()
+            await close_session()
+
+    asyncio.run(runner())
+
+
+if __name__ == "__main__":
+    main()
+

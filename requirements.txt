@@ -1,0 +1,5 @@
+﻿aiohttp
+beautifulsoup4
+httpx
+pandas
+pyppeteer
