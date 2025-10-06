@@ -10,13 +10,13 @@ from .config import INSTITUTION
 from .llm_processor import analyze_connection, close_session, refresh_session
 from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources
 
-DEFAULT_BATCH_SIZE = 8
+DEFAULT_BATCH_SIZE = 5
 DEFAULT_INPUT_PATH = "data/input_names.csv"
 RESULTS_PATH = "data/results.csv"
 PARTIAL_RESULTS_PATH = "data/results_partial.csv"
-INTER_BATCH_DELAY = 2.5  # seconds between batches to prevent rate limiting
+INTER_BATCH_DELAY = 3  # seconds between batches to prevent rate limiting
 NAME_TIMEOUT = 240.0  # maximum time allowed per name before failing
-MAX_CONCURRENT_LLM_CALLS = 4  # limit concurrent LLM API calls to avoid overwhelming the API
+MAX_CONCURRENT_LLM_CALLS = 5  # limit concurrent LLM API calls to avoid overwhelming the API
 
 
 class NameProcessingTimeout(Exception):

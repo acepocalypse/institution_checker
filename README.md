@@ -12,6 +12,55 @@ pip install -e .
 
 You can also create a normal install with `pip install .` if you prefer a non-editable install.
 
+## Output
+
+The tool generates CSV files with the following columns:
+
+### Output Columns
+
+| Column | Description |
+|--------|-------------|
+| `name` | The person's name being checked |
+| `institution` | The target institution (configured in `config.py`) |
+| `connected` | `Y` if connection found, `N` otherwise |
+| `connection_detail` | Brief explanation of the connection or reason for no connection |
+| `current_or_past` | `current` (active now), `past` (former affiliation), or `N/A` (not connected) |
+| `supporting_url` | URL providing evidence of the connection (if found) |
+| `confidence` | `high`, `medium`, or `low` - confidence level in the determination |
+| `temporal_evidence` | Time-based evidence with dates/years if available |
+
+### Output Files
+
+The tool creates the following files in the `data/` directory:
+
+- **`results.csv`**: Final results for all processed names
+- **`results_partial.csv`**: Incrementally updated during batch processing (useful for monitoring progress or recovering from interruptions)
+
+### Example Output
+
+```csv
+name,institution,connected,connection_detail,current_or_past,supporting_url,confidence,temporal_evidence
+Jane Doe,Purdue University,Y,Professor of Computer Science in the Department of CS,current,https://www.cs.purdue.edu/people/faculty/janedoe,high,Currently listed on faculty page as of 2025
+John Smith,Purdue University,N,No verifiable connection found in search results,N/A,,low,No temporal evidence found
+```
+
+### Understanding Results
+
+**Connected (Y/N)**
+- `Y` indicates a verified institutional connection (employment, student/alumni, official role)
+- `N` means no confirmed connection was found
+- Honorary degrees, guest lectures, or news mentions alone do NOT count as connections
+
+**Current vs Past**
+- `current`: Person is actively affiliated now (based on present tense language, recent dates, current listings)
+- `past`: Person had a former affiliation (based on past tense, ended date ranges, "former" language)
+- `N/A`: Not applicable (no connection found)
+
+**Confidence Levels**
+- `high`: Strong, clear evidence from authoritative sources (e.g., official faculty pages)
+- `medium`: Good evidence but with some ambiguity
+- `low`: Weak or unclear evidence, or no connection found
+
 ## Configuration
 
 Before running the tool, you need to configure the LLM API key. You can do this in two ways:
@@ -54,6 +103,33 @@ For compatibility with older workflows you can still call the script directly:
 
 ```powershell
 python main.py --input=data/input_names.csv
+```
+
+### Command-line Options
+
+- `--input=<path>`: Path to input CSV file (default: `data/input_names.csv`)
+  - Must contain a `name` column with person names to check
+- `--batch-size=<number>`: Number of names to process in parallel (default: 8, max: 50)
+  - Larger batches are faster but use more API quota
+- `--batch-delay=<seconds>`: Delay between batches to prevent rate limiting (default: 2.5)
+- `--basic` or `--basic-search`: Use only basic search (faster but less thorough)
+  - By default, the tool uses enhanced search with intelligent fallback
+- `--debug`: Enable detailed debug output for troubleshooting
+
+### Examples
+
+```powershell
+# Process with custom batch size
+institution-checker --input=data/my_names.csv --batch-size=5
+
+# Use basic search for faster processing
+institution-checker --input=data/names.csv --basic-search
+
+# Debug mode with smaller batches
+institution-checker --input=data/test.csv --batch-size=2 --debug
+
+# Custom batch delay for API rate limiting
+institution-checker --input=data/names.csv --batch-delay=5.0
 ```
 
 ## Notebook usage
@@ -157,6 +233,70 @@ importlib.reload(ic)
 ```
 
 If you want, the notebook can add `src` to `sys.path` automatically on load — see `quick_runner_notebook.ipynb` for an example cell.
+
+## Performance and Processing
+
+### Search Strategy
+
+The tool uses an intelligent cascading search approach:
+
+1. **Basic Search First**: Tries a simpler, faster search initially
+2. **Enhanced Search Escalation**: Upgrades to comprehensive multi-query search if:
+   - Fewer than 8 results found, OR
+   - Fewer than 3 high-quality results (relevance score ≥ 10)
+3. **Fallback Protection**: Always attempts basic search before failing
+
+### Processing Pipeline
+
+1. **Phase 1 - Search**: All names in a batch search in parallel
+2. **Phase 2 - LLM Analysis**: Results analyzed in parallel (max 4 concurrent API calls)
+3. **Error Handling**: Failed records are automatically retried with smaller batch sizes
+4. **Resource Management**: Automatic cleanup between batches to prevent performance degradation
+
+### Timeouts and Retries
+
+- **Per-name timeout**: 240 seconds (4 minutes) maximum
+- **Per-LLM-call timeout**: 30 seconds for fast failure
+- **Automatic retries**: Up to 2 attempts for failed LLM calls
+- **Batch retry**: Failed records are automatically retried at the end with smaller batches
+
+### Monitoring Progress
+
+Watch the console output for real-time progress:
+```
+[PIPELINE] Starting: 10 name(s) in 2 batch(es) using enhanced search
+[BATCH] Processing 5 names: Name1, Name2, Name3, Name4, Name5
+[PROGRESS] Starting search for: Name1
+[PROGRESS] Search completed for Name1 in 2.3s, found 15 results
+[PROGRESS] Starting LLM analysis for: Name1
+[OK] Name1: connected (current, high) - Professor of Computer Science
+```
+
+Check `data/results_partial.csv` during long runs to see intermediate results.
+
+## Input Format
+
+Your input CSV file must contain a `name` column:
+
+```csv
+name
+Jane Doe
+John Smith
+Alice Johnson
+```
+
+Additional columns are allowed but will be ignored. The tool processes each name in the `name` column.
+
+## Evaluation and Validation
+
+The output columns are designed for automated evaluation:
+
+- Compare `connected` against ground truth to measure precision/recall
+- Compare `current_or_past` for temporal accuracy
+- Use `confidence` to analyze model certainty
+- Review `temporal_evidence` and `connection_detail` for error analysis
+
+If you need to add evaluation columns (e.g., `all correct`, `connection correct`, `type correct`, `temporal correct`), you can merge the output with your ground truth data using pandas or Excel.
 
 ## Contributing
 
