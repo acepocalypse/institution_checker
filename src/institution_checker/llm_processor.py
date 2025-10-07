@@ -44,6 +44,16 @@ Current vs Past classification:
 - PAST: Former employment (use past tense indicators: "was", "former", "retired", "emeritus", date ranges that ended)
 - Check dates carefully: 2015-2024 is PAST, 2025-present is CURRENT
 
+Connection Type Categories:
+- Alumni: Graduated from the institution (undergraduate, graduate, or professional degree)
+- Attended: Studied at the institution but did not complete degree, or unclear if graduated
+- Executive: Administrator, president, dean, director, or other leadership position
+- Faculty: Professor, instructor, lecturer, or teaching position
+- Postdoc: Postdoctoral researcher or fellow
+- Staff: Non-teaching employee (researcher, technician, support staff)
+- Other: Official connection but none of the above categories fit
+- Others: Use ONLY if not connected (connected = "N")
+
 Instructions:
 1. Return ONLY a JSON object
 2. Use double quotes for all strings
@@ -54,6 +64,7 @@ Instructions:
 Required JSON format:
 {{{{
   "connected": "Y" or "N",
+  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other" or "Others",
   "connection_detail": "Brief explanation",
   "current_or_past": "current" or "past" or "N/A",
   "supporting_url": "URL or empty string",
@@ -176,6 +187,47 @@ def _normalize_connected(value: Any) -> str:
     return "N"
 
 
+def _normalize_connection_type(value: Any, connected: str) -> str:
+    """Normalize connection type to valid options."""
+    text = _safe_text(value).strip()
+    # If not connected, must be "Others"
+    if connected != "Y":
+        return "Others"
+    
+    # Valid connection types (case-insensitive matching)
+    valid_types = {
+        "alumni": "Alumni",
+        "attended": "Attended", 
+        "executive": "Executive",
+        "faculty": "Faculty",
+        "postdoc": "Postdoc",
+        "staff": "Staff",
+        "other": "Other",
+        "others": "Others"
+    }
+    
+    text_lower = text.lower()
+    if text_lower in valid_types:
+        return valid_types[text_lower]
+    
+    # Try partial matching for common variations
+    if "alum" in text_lower or "graduate" in text_lower:
+        return "Alumni"
+    if "student" in text_lower and "post" not in text_lower:
+        return "Attended"
+    if "prof" in text_lower or "teach" in text_lower or "lecturer" in text_lower or "instructor" in text_lower:
+        return "Faculty"
+    if "postdoc" in text_lower or "post-doc" in text_lower:
+        return "Postdoc"
+    if "president" in text_lower or "dean" in text_lower or "director" in text_lower or "admin" in text_lower or "chancellor" in text_lower:
+        return "Executive"
+    if "staff" in text_lower or "researcher" in text_lower or "scientist" in text_lower:
+        return "Staff"
+    
+    # Default to "Other" for connected cases with unclear type
+    return "Other"
+
+
 def _normalize_current_or_past(value: Any) -> str:
     text = _safe_text(value).lower()
     if text in {"current", "present"}:
@@ -267,6 +319,7 @@ def _build_error(reason: str) -> Dict[str, str]:
     message = _safe_text(reason) or "Unknown error"
     return {
         "connected": "N",
+        "connection_type": "Others",
         "connection_detail": f"Error: {message}",
         "current_or_past": "N/A",
         "supporting_url": "",
@@ -276,8 +329,10 @@ def _build_error(reason: str) -> Dict[str, str]:
 
 
 def _normalize_decision(payload: Dict[str, Any]) -> Dict[str, str]:
+    connected = _normalize_connected(payload.get("connected"))
     normalized = {
-        "connected": _normalize_connected(payload.get("connected")),
+        "connected": connected,
+        "connection_type": _normalize_connection_type(payload.get("connection_type"), connected),
         "connection_detail": _safe_text(payload.get("connection_detail")),
         "current_or_past": _normalize_current_or_past(payload.get("current_or_past")),
         "supporting_url": _safe_text(payload.get("supporting_url")),
@@ -287,6 +342,7 @@ def _normalize_decision(payload: Dict[str, Any]) -> Dict[str, str]:
     if normalized["connected"] != "Y":
         normalized["current_or_past"] = "N/A"
         normalized["confidence"] = _normalize_confidence("low")
+        normalized["connection_type"] = "Others"
     return normalized
 
 
@@ -344,6 +400,7 @@ def _extract_fields_with_regex(text: str) -> Dict[str, Any]:
     # Pattern for each field - very flexible
     patterns = {
         "connected": r'"connected"\s*:\s*"([YN])"',
+        "connection_type": r'"connection_type"\s*:\s*"(Alumni|Attended|Executive|Faculty|Postdoc|Staff|Other|Others)"',
         "connection_detail": r'"connection_detail"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
         "current_or_past": r'"current_or_past"\s*:\s*"(current|past|N/A)"',
         "supporting_url": r'"supporting_url"\s*:\s*"([^"]*)"',
@@ -361,6 +418,7 @@ def _extract_fields_with_regex(text: str) -> Dict[str, Any]:
     
     # Set defaults for missing fields
     result.setdefault("connected", "N")
+    result.setdefault("connection_type", "Others")
     result.setdefault("connection_detail", "Unable to determine")
     result.setdefault("current_or_past", "N/A")
     result.setdefault("supporting_url", "")
@@ -731,6 +789,20 @@ def _validate_decision(decision: Dict[str, str], name: str, institution: str) ->
     
     confidence = decision.get("confidence", "")
     if confidence not in ["high", "medium", "low"]:
+        return False
+    
+    # Validate connection_type
+    connection_type = decision.get("connection_type", "")
+    valid_connection_types = ["Alumni", "Attended", "Executive", "Faculty", "Postdoc", "Staff", "Other", "Others"]
+    if connection_type not in valid_connection_types:
+        return False
+    
+    # If connected, must have valid connection type (not "Others")
+    if connected == "Y" and connection_type == "Others":
+        return False
+    
+    # If not connected, must be "Others"
+    if connected == "N" and connection_type != "Others":
         return False
     
     # If connected, must have details

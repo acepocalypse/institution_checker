@@ -212,7 +212,8 @@ def print_result_summary(result: Dict[str, str]) -> None:
         detail = result.get("connection_detail", "")
         status = result.get("current_or_past", "N/A")
         confidence = result.get("confidence", "medium")
-        print(f"[OK] {name}: connected ({status}, {confidence}) - {detail}")
+        conn_type = result.get("connection_type", "Other")
+        print(f"[OK] {name}: connected ({conn_type}, {status}, {confidence}) - {detail}")
     else:
         print(f"[--] {name}: no confirmed connection to {INSTITUTION}")
 
@@ -223,6 +224,7 @@ def build_error_result(name: str, error: Exception) -> Dict[str, str]:
         "name": name,
         "institution": INSTITUTION,
         "connected": "N",
+        "connection_type": "Others",
         "connection_detail": f"Error: {message}",
         "current_or_past": "N/A",
         "supporting_url": "",
