@@ -685,84 +685,59 @@ def _build_strategies(
     institution_clause = _quote_clause(clean_institution)
     institution_fragment = institution_clause or clean_institution
 
-    # OPTIMIZATION: Reduced from max(3, per_strategy_limit) to reduce redundancy
-    base_limit = max(3, min(5, per_strategy_limit))
+    # OPTIMIZATION: Reduced further - focus on highest-value strategies
+    # Each strategy gets fewer results to reduce time
+    base_limit = max(3, min(4, per_strategy_limit))
 
     strategies: List[QueryStrategy] = [
+        # Most important: core profile search
         QueryStrategy(
             name="core_profile",
             query=_compose_query(name_clause, institution_fragment),
-            limit=base_limit,
+            limit=base_limit + 1,  # Slightly higher for most important
             boost=5,
         ),
+        # Current status (high value for current vs past determination)
         QueryStrategy(
             name="current_status",
             query=_compose_query(
                 name_clause,
                 institution_fragment,
-                '("currently" OR "now" OR "serving as" OR "presently" OR "active")',
+                '("currently" OR "now" OR "presently")',
             ),
             limit=base_limit,
             boost=4,
         ),
-        QueryStrategy(
-            name="institution_history",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                '("assistant professor" OR "associate professor" OR "faculty" OR "alumni" OR "student" OR "graduate")',
-            ),
-            limit=base_limit,
-            boost=3,
-        ),
+        # Career history (CV/bio pages are very informative)
         QueryStrategy(
             name="career_timeline",
             query=_compose_query(
                 name_clause,
                 institution_fragment,
-                '("curriculum vitae" OR "cv" OR "biography" OR "resume" OR "profile")',
-            ),
-            limit=max(3, base_limit - 1),
-            boost=2,
-        ),
-        QueryStrategy(
-            name="transition",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                '("joined" OR "appointed" OR "moved to" OR "left" OR "hired" OR "transition" OR "departed")',
+                '("curriculum vitae" OR "cv" OR "biography")',
             ),
             limit=base_limit,
             boost=3,
         ),
     ]
-    if clean_institution:
-        strategies.insert(
-            1,
-            QueryStrategy(
-                name="unquoted_institution",
-                query="{quoted_name} {institution}",
-                limit=base_limit,
-                boost=4,
-                ensure_tokens=False,
-            ),
-        )
-
+    
+    # Add directory search only if we have institution domain
     domain_guess = _institution_domain_guess(clean_institution)
-    site_filter = f"site:{domain_guess}" if domain_guess else "site:.edu"
-    strategies.append(
-        QueryStrategy(
-            name="directory",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                site_filter,
-                '("faculty" OR "staff" OR "directory" OR "people" OR "profile")',
-            ),
-            limit=base_limit,
-            boost=2,
+    if domain_guess:
+        site_filter = f"site:{domain_guess}"
+        strategies.append(
+            QueryStrategy(
+                name="directory",
+                query=_compose_query(
+                    name_clause,
+                    institution_fragment,
+                    site_filter,
+                    '("faculty" OR "staff" OR "directory")',
+                ),
+                limit=base_limit,
+                boost=3,
+            )
         )
-    )
 
     return strategies
 
@@ -844,7 +819,14 @@ async def _execute_strategy(
     institution: str,
     person_name: str,
     debug: bool = False,
+    timeout: float = 20.0,
 ) -> List[Dict[str, object]]:
+    """Execute a single search strategy with reasonable timeout.
+    
+    Timeout is generous (20s) to allow legitimate slow responses while still
+    preventing indefinite hangs. The real speedup comes from fewer strategies
+    and early termination when we have good results.
+    """
     clean_person = _normalise_whitespace(person_name)
     clean_institution = _normalise_whitespace(institution)
     raw_query = strategy.query
@@ -861,13 +843,28 @@ async def _execute_strategy(
     query = _normalise_whitespace(raw_query)
     if strategy.ensure_tokens:
         query = _ensure_name_and_institution(query, clean_person, clean_institution)
-    results = await bing_search(
-        query,
-        num_results=strategy.limit,
-        institution=institution,
-        person_name=clean_person,
-        debug=debug,
-    )
+    
+    try:
+        # Timeout is generous to avoid cutting off legitimate searches
+        results = await asyncio.wait_for(
+            bing_search(
+                query,
+                num_results=strategy.limit,
+                institution=institution,
+                person_name=clean_person,
+                debug=debug,
+            ),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        if debug:
+            print(f"[search] Strategy '{strategy.name}' timed out after {timeout}s")
+        return []
+    except Exception as exc:
+        if debug:
+            print(f"[search] Strategy '{strategy.name}' failed: {exc}")
+        return []
+    
     annotated: List[Dict[str, object]] = []
     for result in results:
         entry = _annotate_signals(result, strategy, query)
@@ -885,8 +882,8 @@ async def enhanced_search(
     if not clean_name:
         return []
 
-    # OPTIMIZATION: Reduced from num_results // 2 to num_results // 3 to reduce redundancy
-    per_strategy_limit = max(4, min(10, num_results // 3 if num_results > 0 else 4))
+    # OPTIMIZATION: Reduced from num_results // 3 to num_results // 4 for faster processing
+    per_strategy_limit = max(3, min(8, num_results // 4 if num_results > 0 else 3))
     strategies = _build_strategies(clean_name, institution, per_strategy_limit)
     if not strategies:
         return await bing_search(
@@ -897,32 +894,86 @@ async def enhanced_search(
             debug=debug,
         )
 
-    sem = asyncio.Semaphore(4)
+    # Reduce concurrent strategies to 3 to avoid overwhelming slow connections
+    sem = asyncio.Semaphore(3)
 
     async def run(strategy: QueryStrategy) -> List[Dict[str, object]]:
         async with sem:
-            return await _execute_strategy(strategy, institution, clean_name, debug=debug)
+            return await _execute_strategy(strategy, institution, clean_name, debug=debug, timeout=20.0)
 
     tasks = [asyncio.create_task(run(strategy)) for strategy in strategies]
     combined: Dict[str, Dict[str, object]] = {}
 
-    results_per_strategy = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for strategy, payload in zip(strategies, results_per_strategy):
-        if isinstance(payload, Exception):
-            if debug:
-                print(f"[search] Strategy '{strategy.name}' failed: {payload}")
-            continue
-        for result in payload:
-            url = result.get("url")
-            if not url:
+    # OPTIMIZATION: Early termination - if we get good results quickly, don't wait for slow strategies
+    # This is SAFE because we only terminate when we already have sufficient high-quality results
+    early_termination_threshold = max(10, num_results // 2)  # e.g., 10 results for 20 requested
+    high_quality_threshold = 15  # relevance score for "high quality"
+    
+    completed_strategies = 0
+    for coro in asyncio.as_completed(tasks):
+        try:
+            payload = await coro
+            completed_strategies += 1
+            
+            if isinstance(payload, Exception):
+                if debug:
+                    print(f"[search] A strategy failed: {payload}")
                 continue
-            if url in combined:
-                combined[url] = _merge_results(combined[url], result)
-            else:
-                combined[url] = result
-        if debug:
-            print(f"[search] Aggregated {len(combined)} results after '{strategy.name}'")
+            
+            # Merge results from this strategy
+            strategy_idx = None
+            for idx, task in enumerate(tasks):
+                if task == coro:
+                    strategy_idx = idx
+                    break
+            
+            strategy = strategies[strategy_idx] if strategy_idx is not None else None
+            
+            for result in payload:
+                url = result.get("url")
+                if not url:
+                    continue
+                if url in combined:
+                    combined[url] = _merge_results(combined[url], result)
+                else:
+                    combined[url] = result
+            
+            if debug and strategy:
+                print(f"[search] Completed '{strategy.name}' ({completed_strategies}/{len(strategies)}): {len(combined)} total results")
+            
+            # Check for early termination: if we have enough high-quality results, stop waiting
+            high_quality_results = [
+                r for r in combined.values()
+                if r["signals"].get("relevance_score", 0) >= high_quality_threshold
+            ]
+            
+            # Terminate early if:
+            # 1. We have at least threshold number of total results AND
+            # 2. At least half of them are high-quality AND
+            # 3. We've completed at least half the strategies (to ensure diversity)
+            if (len(combined) >= early_termination_threshold and 
+                len(high_quality_results) >= early_termination_threshold // 2 and
+                completed_strategies >= len(strategies) // 2):
+                
+                if debug:
+                    print(f"[search] Early termination: {len(combined)} results ({len(high_quality_results)} high-quality) after {completed_strategies}/{len(strategies)} strategies")
+                
+                # Cancel remaining tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                break
+                
+        except asyncio.CancelledError:
+            # Expected when we cancel tasks during early termination
+            continue
+        except Exception as exc:
+            if debug:
+                print(f"[search] Unexpected error processing strategy result: {exc}")
+            continue
+
+    # Wait for any remaining tasks (should be quick or already done)
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     ordered = sorted(
         combined.values(),
@@ -934,7 +985,12 @@ async def enhanced_search(
         reverse=True,
     )
 
-    if not ordered:
+    # SAFETY: If we don't have enough results (e.g., all strategies timed out or failed),
+    # fall back to basic search to ensure we don't return empty results
+    min_acceptable_results = max(5, num_results // 4)
+    if len(ordered) < min_acceptable_results:
+        if debug:
+            print(f"[search] Only {len(ordered)} results from enhanced search, falling back to basic search")
         return await bing_search(
             clean_name,
             num_results=num_results,
