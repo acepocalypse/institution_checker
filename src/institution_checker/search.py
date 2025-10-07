@@ -65,6 +65,11 @@ PAST_TERMS = [
     "retired",
     "emeritus",
     "alumni",
+    "alumnus",
+    "alumna",
+    "alum",
+    "graduated",
+    "graduate of",
     "was at",
     "worked at",
     "served as",
@@ -86,6 +91,11 @@ ACADEMIC_TERMS = [
     "student",
     "doctoral",
     "phd candidate",
+    "phd from",
+    "earned degree",
+    "bachelor",
+    "master",
+    "doctorate",
 ]
 TRANSITION_TERMS = [
     "joined",

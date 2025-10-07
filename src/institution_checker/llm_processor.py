@@ -16,7 +16,7 @@ _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 _last_refresh_time = 0.0
 
-MAX_RESULTS_FOR_PROMPT = 12  # Increased to provide more context to LLM
+MAX_RESULTS_FOR_PROMPT = 15  # Increased to provide more context to LLM
 
 # Simplified prompt that's easier for the model to follow
 PROMPT_TEMPLATE = """Analyze if this person has an official connection to the institution.
@@ -29,40 +29,55 @@ Current year: {current_year}
 Search results:
 {search_findings}
 
-Valid connections:
-- Employment (professor, staff, researcher)
-- Student/alumni
-- Official visiting/fellowship roles
+CRITICAL INSTRUCTIONS - READ CAREFULLY:
+1. Read EVERY search result completely before making a decision
+2. Education connections (alumni/student) are JUST AS VALID as employment
+3. Look for: "bachelor's degree from", "PhD from", "master's from", "graduated from", "degree from", "attended"
+4. Example: "received his bachelor's degree from Purdue University" = Alumni connection (connected = Y)
+
+Valid connections include:
+- **ALUMNI**: Graduated from the institution (ANY degree - BS, MS, PhD, professional)
+  * Clear indicators: "bachelor's degree from X", "PhD from X", "graduated from X", "degree from X"
+  * Example: "Kaiser received in 1950 his bachelor's degree from Purdue" = Alumni
+- **Student/Attended**: Currently studying or studied there
+- **Employment**: Professor, staff, researcher, administrator
+- **Official roles**: Visiting scholar, fellow
 
 NOT valid:
-- Honorary degrees or awards
-- Guest lectures or talks
-- News mentions without employment
-
-Current vs Past classification:
-- CURRENT: Active employment NOW (use present tense indicators: "is", "currently", "works at")
-- PAST: Former employment (use past tense indicators: "was", "former", "retired", "emeritus", date ranges that ended)
-- Check dates carefully: 2015-2024 is PAST, 2025-present is CURRENT
+- Honorary degrees (unless also employed/studied there)
+- Guest lectures (unless also employed/studied there)
+- News mentions without employment or education
 
 Connection Type Categories:
-- Alumni: Graduated from the institution (undergraduate, graduate, or professional degree)
-- Attended: Studied at the institution but did not complete degree, or unclear if graduated
-- Executive: Administrator, president, dean, director, or other leadership position
-- Faculty: Professor, instructor, lecturer, or teaching position
-- Postdoc: Postdoctoral researcher or fellow
-- Staff: Non-teaching employee (researcher, technician, support staff)
-- Other: Official connection but none of the above categories fit
-- Others: Use ONLY if not connected (connected = "N")
+- **Alumni**: Graduated with a degree (look for "degree from", "graduated from")
+- **Attended**: Studied but unclear if graduated
+- **Executive**: Administrator, president, dean, director
+- **Faculty**: Professor, instructor, lecturer
+- **Postdoc**: Postdoctoral researcher
+- **Staff**: Researcher, technician, support staff
+- **Other**: Official connection not covered above
+- **Others**: ONLY if NO connection (connected = "N")
+
+Current vs Past:
+- **PAST**: Alumni (degree in past), former employee, past tense
+- **CURRENT**: Currently employed/studying, present tense
+- Note: Alumni is ALWAYS "past" (degree was earned in the past)
 
 Instructions:
-1. Return ONLY a JSON object
-2. Use double quotes for all strings
-3. Escape any quotes inside strings with backslash
-4. Do NOT include markdown, comments, or extra text
-5. Ensure the JSON is complete and ends with }}
+1. Review ALL search results - check every single one
+2. Return ONLY valid JSON with no markdown
+3. If you see degree/education evidence, mark connected = "Y"
 
 Required JSON format:
 {{{{
+  "connected": "Y" or "N",
+  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other" or "Others",
+  "connection_detail": "Specific evidence from search results",
+  "current_or_past": "current" or "past" or "N/A",
+  "supporting_url": "URL from search results",
+  "confidence": "high" or "medium" or "low",
+  "temporal_evidence": "Dates/years from results"
+}}}}"""
   "connected": "Y" or "N",
   "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other"",
   "connection_detail": "Brief explanation",
@@ -70,7 +85,7 @@ Required JSON format:
   "supporting_url": "URL or empty string",
   "confidence": "high" or "medium" or "low",
   "temporal_evidence": "Time-based evidence with dates/years if available"
-}}}}"""
+}}}}
 
 DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=15, sock_read=150)
 JSON_BLOCK_RE = re.compile(r"```(?:json)?(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -347,6 +362,7 @@ def _normalize_decision(payload: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _format_result_row(result: Dict[str, Any], index: int) -> str:
+    """Format a search result for LLM consumption with clear structure."""
     title = _safe_text(result.get("title"))
     snippet = _safe_text(result.get("snippet"))
     url = _safe_text(result.get("url"))
@@ -355,20 +371,29 @@ def _format_result_row(result: Dict[str, Any], index: int) -> str:
     relevance = signals.get("relevance_score", 0)
     has_current = signals.get("has_current", False)
     has_past = signals.get("has_past", False)
+    
+    # Format with clear labels for better LLM parsing
     rank_prefix = f"#{rank} " if isinstance(rank, int) else ""
-    lines = [f"{rank_prefix}{title}"] if title else []
+    lines = []
+    
+    if title:
+        lines.append(f"Title: {rank_prefix}{title}")
     if snippet:
-        lines.append(snippet)
+        lines.append(f"Description: {snippet}")
     if url:
-        lines.append(url)
+        lines.append(f"URL: {url}")
+    
+    # Add temporal signals to help LLM identify current vs past
     if relevance > 0 or has_current or has_past:
         signal_info = f"Relevance: {relevance}"
         if has_current:
-            signal_info += " [CURRENT]"
+            signal_info += " [Contains CURRENT indicators]"
         if has_past:
-            signal_info += " [PAST]"
+            signal_info += " [Contains PAST indicators]"
         lines.append(signal_info)
-    payload = " | ".join(lines)
+    
+    # Use newlines for better readability by LLM
+    payload = "\n   ".join(lines)
     return f"{index + 1}. {payload}"
 
 
