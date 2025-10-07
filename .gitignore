@@ -5,6 +5,8 @@ data/
 __pycache__/
 *.py[cod]
 *$py.class
+src/institution_checker_pycache_/
+**/*.pyc
 
 # C extensions
 *.so

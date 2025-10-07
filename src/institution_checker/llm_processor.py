@@ -30,15 +30,23 @@ Search results:
 {search_findings}
 
 CRITICAL INSTRUCTIONS - READ CAREFULLY:
-1. Read EVERY search result completely before making a decision
-2. Education connections (alumni/student) are JUST AS VALID as employment
-3. Look for: "bachelor's degree from", "PhD from", "master's from", "graduated from", "degree from", "attended"
-4. Example: "received his bachelor's degree from Purdue University" = Alumni connection (connected = Y)
+1. **READ EVERY SINGLE SEARCH RESULT** before making any decision
+2. Look through ALL results - the connection evidence might be in result #5, #10, or #15
+3. Education connections (alumni/student) are JUST AS VALID as employment
+4. Look for these education indicators:
+   - "bachelor's degree from", "BS from", "PhD from", "master's from", "MS from"
+   - "graduated from", "degree from", "attended", "studied at"
+   - Example: "received his bachelor's degree from Purdue University" = Alumni connection (Y)
+   - Example: "earned her PhD from MIT in 1995" = Alumni connection (Y)
+
+**EXAMPLES OF VALID CONNECTIONS:**
+- "John earned his PhD from Stanford in 2010" → connected=Y, type=Alumni, past
+- "Jane is a professor at Harvard" → connected=Y, type=Faculty, current
+- "Bob graduated from MIT with a bachelor's degree" → connected=Y, type=Alumni, past
+- "Alice was a postdoc at Berkeley from 2015-2017" → connected=Y, type=Postdoc, past
 
 Valid connections include:
 - **ALUMNI**: Graduated from the institution (ANY degree - BS, MS, PhD, professional)
-  * Clear indicators: "bachelor's degree from X", "PhD from X", "graduated from X", "degree from X"
-  * Example: "Kaiser received in 1950 his bachelor's degree from Purdue" = Alumni
 - **Student/Attended**: Currently studying or studied there
 - **Employment**: Professor, staff, researcher, administrator
 - **Official roles**: Visiting scholar, fellow
@@ -49,7 +57,7 @@ NOT valid:
 - News mentions without employment or education
 
 Connection Type Categories:
-- **Alumni**: Graduated with a degree (look for "degree from", "graduated from")
+- **Alumni**: Graduated with a degree
 - **Attended**: Studied but unclear if graduated
 - **Executive**: Administrator, president, dean, director
 - **Faculty**: Professor, instructor, lecturer
@@ -63,12 +71,9 @@ Current vs Past:
 - **CURRENT**: Currently employed/studying, present tense
 - Note: Alumni is ALWAYS "past" (degree was earned in the past)
 
-Instructions:
-1. Review ALL search results - check every single one
-2. Return ONLY valid JSON with no markdown
-3. If you see degree/education evidence, mark connected = "Y"
+**IMPORTANT**: Before saying "N", double-check you read ALL {max_results} results above.
 
-Required JSON format:
+Required JSON format (no markdown, just JSON):
 {{{{
   "connected": "Y" or "N",
   "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other" or "Others",
@@ -78,14 +83,6 @@ Required JSON format:
   "confidence": "high" or "medium" or "low",
   "temporal_evidence": "Dates/years from results"
 }}}}"""
-  "connected": "Y" or "N",
-  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other"",
-  "connection_detail": "Brief explanation",
-  "current_or_past": "current" or "past" or "N/A",
-  "supporting_url": "URL or empty string",
-  "confidence": "high" or "medium" or "low",
-  "temporal_evidence": "Time-based evidence with dates/years if available"
-}}}}
 
 DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=15, sock_read=150)
 JSON_BLOCK_RE = re.compile(r"```(?:json)?(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -415,6 +412,7 @@ def _build_prompt(name: str, institution: str, results: List[Dict[str, Any]]) ->
         name=name,
         institution=institution,
         search_findings=findings,
+        max_results=min(len(results), MAX_RESULTS_FOR_PROMPT),
     )
 
 
@@ -553,8 +551,8 @@ def _parse_response(raw: str) -> Dict[str, Any]:
     )
 
 
-async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.1) -> Dict[str, Any]:
-    """Call LLM without max_tokens limit - let thinking model use what it needs."""
+async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.2) -> Dict[str, Any]:
+    """Call LLM with moderate temperature for consistent but flexible reasoning."""
     session = await get_session()
     headers = {
         "Authorization": f"Bearer {get_api_key()}",
@@ -563,11 +561,11 @@ async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.1) 
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": "You are a JSON generator. Output ONLY valid JSON with no markdown or extra text."},
+            {"role": "system", "content": "You are a JSON generator. Output ONLY valid JSON with no markdown or extra text. You are thorough and read all provided information before making decisions."},
             {"role": "user", "content": prompt},
         ],
         "temperature": temperature,
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",  # Changed from "low" to "medium" for better reasoning
         # No max_tokens - thinking models need unlimited tokens for reasoning + output
     }
     
@@ -699,7 +697,10 @@ def _postprocess_decision(
     results: List[Dict[str, Any]],
     decision: Dict[str, str],
 ) -> Dict[str, str]:
-    """Improve current/past classification using search result analysis."""
+    """Improve current/past classification using search result analysis.
+    
+    Note: Only override LLM with VERY STRONG evidence to maintain consistency.
+    """
     try:
         if not decision or decision.get("connected") != "Y":
             return decision
@@ -749,16 +750,13 @@ def _postprocess_decision(
                 if is_edu and _count_temporal_signals(text, CURRENT_TERMS) > 0:
                     other_current_edu_urls.append(url)
 
-        # Decision logic: override LLM if we have strong evidence
+        # Decision logic: ONLY override LLM with VERY STRONG evidence (raised thresholds)
         current_classification = decision.get("current_or_past", "current")
         
-        # Rule 1: If LLM says current, but we have strong past signals
+        # Rule 1: If LLM says current, but we have VERY STRONG past signals
         if current_classification == "current":
-            # Strong evidence it's past:
-            # - Multiple past terms in target institution results
-            # - Date ranges showing position ended
-            # - Currently at another institution
-            if target_past_count >= 3 or len(target_urls_with_end_dates) >= 2 or len(other_current_edu_urls) >= 2:
+            # Need VERY strong evidence to override (increased thresholds)
+            if target_past_count >= 5 or len(target_urls_with_end_dates) >= 3 or len(other_current_edu_urls) >= 3:
                 updated = dict(decision)
                 updated["current_or_past"] = "past"
                 conf = updated.get("confidence", "medium").lower()
@@ -766,32 +764,29 @@ def _postprocess_decision(
                     updated["confidence"] = "medium"
                 
                 evidence = updated.get("temporal_evidence", "").strip()
-                if target_past_count >= 3:
-                    extra = f"Multiple past-tense indicators found ({target_past_count} signals)"
-                elif len(target_urls_with_end_dates) >= 2:
-                    extra = "Position ended based on date ranges in search results"
+                if target_past_count >= 5:
+                    extra = f"Very strong past-tense indicators found ({target_past_count} signals)"
+                elif len(target_urls_with_end_dates) >= 3:
+                    extra = "Position clearly ended based on multiple date ranges"
                 else:
-                    extra = "Currently affiliated with another institution"
+                    extra = "Strong evidence of current affiliation with another institution"
                 
                 updated["temporal_evidence"] = f"{evidence}; {extra}" if evidence else extra
                 return updated
         
-        # Rule 2: If LLM says past, but we have strong current signals
+        # Rule 2: If LLM says past, but we have VERY STRONG current signals
         elif current_classification == "past":
-            # Strong evidence it's current:
-            # - Multiple current terms
-            # - Recent years (last 2 years)
-            # - More current than past signals
-            if (target_current_count >= 3 and target_current_count > target_past_count) or len(target_recent_years) >= 2:
+            # Need VERY strong evidence to override (increased thresholds)
+            if (target_current_count >= 5 and target_current_count > target_past_count + 2) or len(target_recent_years) >= 3:
                 updated = dict(decision)
                 updated["current_or_past"] = "current"
                 
                 evidence = updated.get("temporal_evidence", "").strip()
-                if len(target_recent_years) >= 2:
+                if len(target_recent_years) >= 3:
                     years_str = ", ".join(str(y) for y in sorted(set(target_recent_years))[:3])
-                    extra = f"Recent activity found ({years_str})"
+                    extra = f"Strong recent activity found ({years_str})"
                 else:
-                    extra = f"Multiple current indicators ({target_current_count} signals)"
+                    extra = f"Very strong current indicators ({target_current_count} signals vs {target_past_count} past)"
                 
                 updated["temporal_evidence"] = f"{evidence}; {extra}" if evidence else extra
                 return updated
@@ -830,41 +825,18 @@ def _validate_decision(decision: Dict[str, str], name: str, institution: str) ->
     if connected == "N" and connection_type != "Others":
         return False
     
-    # If connected, must have details
+    # If connected, must have details (relaxed requirement)
     if connected == "Y":
         detail = decision.get("connection_detail", "").strip()
-        if not detail or len(detail) < 10:
+        if not detail or len(detail) < 5:  # Relaxed from 10 to 5
             return False
-        if "error" in detail.lower() or "unable to determine" in detail.lower():
+        if "error" in detail.lower():  # Removed "unable to determine" check - that can be valid
             return False
         # Must specify current or past
         if current_or_past == "N/A":
             return False
     
-    # If not connected, check for suspiciously generic or short responses
-    if connected == "N":
-        detail = decision.get("connection_detail", "").strip()
-        temporal = decision.get("temporal_evidence", "").strip()
-        
-        # Flag suspiciously short responses (likely incomplete/truncated)
-        if len(detail) < 15 and len(temporal) < 15:
-            return False
-        
-        # Check for generic/templated responses that suggest timeout/failure
-        generic_phrases = [
-            "no evidence found",
-            "no connection found", 
-            "unable to confirm",
-            "insufficient information",
-            "not found in search results"
-        ]
-        # If detail is ONLY a generic phrase (no specific reasoning), it's suspicious
-        detail_lower = detail.lower()
-        if any(phrase in detail_lower for phrase in generic_phrases) and len(detail) < 50:
-            # Very short generic response - likely incomplete
-            return False
-    
-    # If not connected, current_or_past should be N/A
+    # Relaxed validation for "N" responses - removed suspicious checks that may reject valid responses
     if connected == "N" and current_or_past != "N/A":
         return False
     
@@ -878,9 +850,9 @@ async def analyze_connection(
     *,
     debug: bool = False,
     max_retries: int = 2,
-    per_attempt_timeout: float = 30.0,  # Fail fast if single attempt takes > 30s
+    per_attempt_timeout: float = 45.0,  # Increased from 30s to 45s for thinking models
 ) -> Dict[str, str]:
-    """Analyze connection with minimal retries and per-attempt timeout.
+    """Analyze connection with retries and per-attempt timeout.
     
     Args:
         name: Person's name
@@ -888,7 +860,7 @@ async def analyze_connection(
         results: Search results
         debug: Enable debug output
         max_retries: Maximum retry attempts
-        per_attempt_timeout: Maximum seconds per LLM API call (default 30s)
+        per_attempt_timeout: Maximum seconds per LLM API call (default 45s)
     """
     name = _safe_text(name)
     institution = _safe_text(institution)
@@ -901,10 +873,11 @@ async def analyze_connection(
             if debug and attempt > 1:
                 print(f"[LLM] Retry attempt {attempt}/{max_retries}")
             
-            # Add per-attempt timeout to fail fast on slow API calls
+            # Add per-attempt timeout
             try:
+                # Use temperature 0.2 for better consistency while allowing some flexibility
                 parsed = await asyncio.wait_for(
-                    _call_llm(prompt, debug=debug, temperature=0.0),
+                    _call_llm(prompt, debug=debug, temperature=0.2),
                     timeout=per_attempt_timeout
                 )
             except asyncio.TimeoutError:
@@ -914,20 +887,25 @@ async def analyze_connection(
             
             decision = _normalize_decision(parsed)
             
-            # Basic validation
+            # Validate decision
             if not _validate_decision(decision, name, institution):
                 if debug:
-                    print(f"[LLM] Decision failed validation")
+                    print(f"[LLM] Decision failed validation: {decision}")
                 if attempt < max_retries:
                     await asyncio.sleep(1.0)
                     continue
-                # Use it anyway if last attempt
+                # On last attempt, try to salvage if connected=Y
+                if decision.get("connected") == "Y":
+                    if debug:
+                        print(f"[LLM] Using potentially invalid decision (last attempt, connected=Y)")
+                else:
+                    raise ValueError("Decision failed validation")
             
-            # Post-process to improve accuracy
+            # Post-process with relaxed override thresholds
             decision = _postprocess_decision(name, institution, results or [], decision)
             
             if debug:
-                print(f"[LLM] Analysis complete")
+                print(f"[LLM] Analysis complete: {decision}")
             
             return decision
             
