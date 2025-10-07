@@ -40,11 +40,23 @@ The tool generates CSV files with the following columns:
 | `name` | The person's name being checked |
 | `institution` | The target institution (configured in `config.py`) |
 | `connected` | `Y` if connection found, `N` otherwise |
+| `connection_type` | Type of connection: `Alumni`, `Attended`, `Executive`, `Faculty`, `Postdoc`, `Staff`, `Other`, or `Others` (not connected) |
 | `connection_detail` | Brief explanation of the connection or reason for no connection |
 | `current_or_past` | `current` (active now), `past` (former affiliation), or `N/A` (not connected) |
 | `supporting_url` | URL providing evidence of the connection (if found) |
 | `confidence` | `high`, `medium`, or `low` - confidence level in the determination |
 | `temporal_evidence` | Time-based evidence with dates/years if available |
+
+#### Connection Type Categories
+
+- **Alumni**: Graduated from the institution (undergraduate, graduate, or professional degree)
+- **Attended**: Studied at the institution but did not complete degree, or unclear if graduated
+- **Executive**: Administrator, president, dean, director, or other leadership position
+- **Faculty**: Professor, instructor, lecturer, or teaching position
+- **Postdoc**: Postdoctoral researcher or fellow
+- **Staff**: Non-teaching employee (researcher, technician, support staff)
+- **Other**: Official connection but none of the above categories fit
+- **Others**: No connection found (used when `connected` = `N`)
 
 ### Output Files
 
@@ -56,9 +68,11 @@ The tool creates the following files in the `data/` directory:
 ### Example Output
 
 ```csv
-name,institution,connected,connection_detail,current_or_past,supporting_url,confidence,temporal_evidence
-Jane Doe,Purdue University,Y,Professor of Computer Science in the Department of CS,current,https://www.cs.purdue.edu/people/faculty/janedoe,high,Currently listed on faculty page as of 2025
-John Smith,Purdue University,N,No verifiable connection found in search results,N/A,,low,No temporal evidence found
+name,institution,connected,connection_type,connection_detail,current_or_past,supporting_url,confidence,temporal_evidence
+Jane Doe,Purdue University,Y,Faculty,Professor of Computer Science in the Department of CS,current,https://www.cs.purdue.edu/people/faculty/janedoe,high,Currently listed on faculty page as of 2025
+John Smith,Purdue University,N,Others,No verifiable connection found in search results,N/A,,low,No temporal evidence found
+Bob Johnson,Purdue University,Y,Alumni,PhD in Electrical Engineering completed in 2018,past,https://engineering.purdue.edu/ECE/Alumni/Distinguished/johnson,high,Graduated 2018; multiple references to degree completion
+Mary Williams,Purdue University,Y,Executive,Former Dean of the College of Engineering from 2015-2022,past,https://www.purdue.edu/newsroom/releases/2015/Q2/williams-named-dean.html,high,Served as Dean until 2022 based on news archives
 ```
 
 ### Understanding Results

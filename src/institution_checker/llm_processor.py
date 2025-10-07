@@ -64,7 +64,7 @@ Instructions:
 Required JSON format:
 {{{{
   "connected": "Y" or "N",
-  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other" or "Others",
+  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other"",
   "connection_detail": "Brief explanation",
   "current_or_past": "current" or "past" or "N/A",
   "supporting_url": "URL or empty string",
