@@ -3,6 +3,20 @@ import os
 
 INSTITUTION = "Purdue University"   # can be changed by user
 
+# Campus filtering policy
+# Set to True to accept IUPUI/IUPFW as Purdue connections
+# Set to False to reject them (they are joint IU-Purdue campuses)
+ACCEPT_JOINT_CAMPUSES = False  # Default: reject IUPUI/IUPFW
+
+# Joint campus identifiers to filter
+JOINT_CAMPUS_PATTERNS = [
+    "iupui",  # Indiana University-Purdue University Indianapolis
+    "iupfw",  # Indiana University-Purdue University Fort Wayne
+    "indiana university purdue university",
+    "indiana university-purdue university",
+    "iu-purdue",
+]
+
 LLM_API_URL = "https://genai.rcac.purdue.edu/api/chat/completions"
 _api_key = None
 

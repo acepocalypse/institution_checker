@@ -10,12 +10,30 @@ from .config import INSTITUTION
 from .llm_processor import analyze_connection, close_session, refresh_session
 from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources
 
+# Import the text fixing utility
+try:
+    import ftfy
+    FTFY_AVAILABLE = True
+except ImportError:
+    FTFY_AVAILABLE = False
+
+
+def _fix_text_encoding(text: str) -> str:
+    """Fix mojibake and encoding errors in text using ftfy."""
+    if not text or not FTFY_AVAILABLE:
+        return text
+    try:
+        return ftfy.fix_text(text)
+    except Exception:
+        return text
+
 DEFAULT_BATCH_SIZE = 5
 DEFAULT_INPUT_PATH = "data/input_names.csv"
 RESULTS_PATH = "data/results.csv"
 PARTIAL_RESULTS_PATH = "data/results_partial.csv"
 INTER_BATCH_DELAY = 3  # seconds between batches to prevent rate limiting
-NAME_TIMEOUT = 240.0  # maximum time allowed per name before failing
+NAME_TIMEOUT = 60.0  # maximum time allowed per name before failing (reduced from 240s to prevent runaway searches)
+SEARCH_TIMEOUT = 45.0  # maximum time for search phase per name (should complete well before NAME_TIMEOUT)
 MAX_CONCURRENT_LLM_CALLS = 5  # limit concurrent LLM API calls to avoid overwhelming the API
 
 
@@ -35,7 +53,7 @@ def load_names(path: str) -> List[str]:
     if "name" not in data.columns:
         raise ValueError('CSV file must contain a "name" column')
     return [
-        str(value).strip()
+        _fix_text_encoding(str(value).strip())
         for value in data["name"].dropna()
         if str(value).strip()
     ]
@@ -48,56 +66,70 @@ def _ensure_parent_dir(path: str) -> None:
 
 
 async def process_name_search(name: str, use_enhanced_search: bool, debug: bool = False) -> tuple[str, List[Dict[str, Any]]]:
-    """Phase 1: Perform search for a name and return results."""
+    """Phase 1: Perform search for a name and return results.
+    
+    Applies SEARCH_TIMEOUT to ensure searches complete quickly even if individual
+    strategies are slow. This prevents one slow search from blocking the entire batch.
+    """
     search_start = time.time()
     
     print(f"[PROGRESS] Starting search for: {name}")
     
-    try:
-        # Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
-        if use_enhanced_search:
-            # Try basic search first (faster, less redundant)
-            query = f'"{name}" "{INSTITUTION}"'
-            print(f"[PROGRESS] Trying basic search first for efficiency...")
-            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
-            
-            # Evaluate if we need enhanced search
-            # Check for high-quality results with strong signals
-            high_quality_count = sum(
-                1 for r in results 
-                if r.get('signals', {}).get('relevance_score', 0) >= 10
-            )
-            
-            # Escalate to enhanced search if:
-            # - Less than 8 total results, OR
-            # - Less than 3 high-quality results (to ensure thorough checking)
-            needs_enhanced = len(results) < 8 or high_quality_count < 3
-            
-            if needs_enhanced:
-                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
-                results = await enhanced_search(name, INSTITUTION, num_results=20, debug=debug)
+    async def _do_search() -> tuple[str, List[Dict[str, Any]]]:
+        """Inner function that performs the actual search."""
+        try:
+            # Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
+            if use_enhanced_search:
+                # Try basic search first (faster, less redundant)
+                query = f'"{name}" "{INSTITUTION}"'
+                print(f"[PROGRESS] Trying basic search first for efficiency...")
+                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+                
+                # Evaluate if we need enhanced search
+                # Check for high-quality results with strong signals
+                high_quality_count = sum(
+                    1 for r in results 
+                    if r.get('signals', {}).get('relevance_score', 0) >= 10
+                )
+                
+                # Escalate to enhanced search if:
+                # - Less than 8 total results, OR
+                # - Less than 3 high-quality results (to ensure thorough checking)
+                needs_enhanced = len(results) < 8 or high_quality_count < 3
+                
+                if needs_enhanced:
+                    print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
+                    results = await enhanced_search(name, INSTITUTION, num_results=20, debug=debug)
+                else:
+                    print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
+                
+                # Final fallback if still no results
+                if not results:
+                    print(f"[WARN] No results from either search method")
             else:
-                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
+                query = f'"{name}" {INSTITUTION}'
+                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
             
-            # Final fallback if still no results
+            search_elapsed = time.time() - search_start
+            print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
+            
             if not results:
-                print(f"[WARN] No results from either search method")
-        else:
-            query = f'"{name}" {INSTITUTION}'
-            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
-        
-        search_elapsed = time.time() - search_start
-        print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
-        
-        if not results:
-            print(f"[WARN] No search results found for {name}")
-        
-        return name, results
-        
-    except Exception as e:
+                print(f"[WARN] No search results found for {name}")
+            
+            return name, results
+            
+        except Exception as e:
+            elapsed = time.time() - search_start
+            print(f"[ERROR] Search failed for {name} after {elapsed:.1f}s: {e}")
+            raise
+    
+    # Apply timeout to search to fail fast if it's taking too long
+    try:
+        return await asyncio.wait_for(_do_search(), timeout=SEARCH_TIMEOUT)
+    except asyncio.TimeoutError:
         elapsed = time.time() - search_start
-        print(f"[ERROR] Search failed for {name} after {elapsed:.1f}s: {e}")
-        raise
+        print(f"[ERROR] Search timed out for {name} after {elapsed:.1f}s (limit: {SEARCH_TIMEOUT}s)")
+        raise TimeoutError(f"Search exceeded {SEARCH_TIMEOUT}s timeout")
 
 
 async def process_name_llm(name: str, results: List[Dict[str, Any]], debug: bool = False) -> Dict[str, str]:
@@ -297,7 +329,11 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
     
     for name, outcome in zip(names, search_outcomes):
         if isinstance(outcome, Exception):
-            print(f"[BATCH] Search failed for {name}: {outcome}")
+            error_msg = str(outcome)
+            if "timeout" in error_msg.lower():
+                print(f"[BATCH] Search timed out for {name}: {error_msg}")
+            else:
+                print(f"[BATCH] Search failed for {name}: {error_msg}")
             failed_searches[name] = outcome
             search_results[name] = []  # Empty results for failed searches
         else:
@@ -338,11 +374,15 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
         
         # Check if search failed first
         if name in failed_searches:
-            print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) - search error")
-            result = build_error_result(name, failed_searches[name])
+            error = failed_searches[name]
+            if "timeout" in str(error).lower():
+                print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) - search timeout after {elapsed:.1f}s")
+            else:
+                print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) - search error")
+            result = build_error_result(name, error)
         elif isinstance(llm_outcome, Exception):
             if isinstance(llm_outcome, asyncio.TimeoutError):
-                print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
+                print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) - LLM timeout after {elapsed:.1f}s")
                 result = build_error_result(name, NameProcessingTimeout(name, NAME_TIMEOUT))
             else:
                 print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: {llm_outcome}")

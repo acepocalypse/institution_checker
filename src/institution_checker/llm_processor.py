@@ -18,8 +18,8 @@ _last_refresh_time = 0.0
 
 MAX_RESULTS_FOR_PROMPT = 15  # Increased to provide more context to LLM
 
-# Simplified prompt that's easier for the model to follow
-PROMPT_TEMPLATE = """Analyze if this person has an official connection to the institution.
+# STRICT EVIDENCE-BASED PROMPT - Designed to minimize false positives
+PROMPT_TEMPLATE = """Determine if this person has a VERIFIED official connection to the institution.
 
 Person: {name}
 Institution: {institution}
@@ -29,59 +29,142 @@ Current year: {current_year}
 Search results:
 {search_findings}
 
-CRITICAL INSTRUCTIONS - READ CAREFULLY:
-1. **READ EVERY SINGLE SEARCH RESULT** before making any decision
-2. Look through ALL results - the connection evidence might be in result #5, #10, or #15
-3. Education connections (alumni/student) are JUST AS VALID as employment
-4. Look for these education indicators:
-   - "bachelor's degree from", "BS from", "PhD from", "master's from", "MS from"
-   - "graduated from", "degree from", "attended", "studied at"
-   - Example: "received his bachelor's degree from Purdue University" = Alumni connection (Y)
-   - Example: "earned her PhD from MIT in 1995" = Alumni connection (Y)
+═══════════════════════════════════════════════════════════════════════
+CRITICAL: BE EXTREMELY CONSERVATIVE - Default to "N" unless STRONG EXPLICIT EVIDENCE
+═══════════════════════════════════════════════════════════════════════
 
-**EXAMPLES OF VALID CONNECTIONS:**
-- "John earned his PhD from Stanford in 2010" → connected=Y, type=Alumni, past
-- "Jane is a professor at Harvard" → connected=Y, type=Faculty, current
-- "Bob graduated from MIT with a bachelor's degree" → connected=Y, type=Alumni, past
-- "Alice was a postdoc at Berkeley from 2015-2017" → connected=Y, type=Postdoc, past
+REQUIRED EVIDENCE - Must have AT LEAST ONE:
 
-Valid connections include:
-- **ALUMNI**: Graduated from the institution (ANY degree - BS, MS, PhD, professional)
-- **Student/Attended**: Currently studying or studied there
-- **Employment**: Professor, staff, researcher, administrator
-- **Official roles**: Visiting scholar, fellow
+1. **Official .edu page from the institution** listing them as faculty/staff/student
+   - Faculty directory page
+   - Department people page
+   - Official student/alumni registry
+   
+2. **Explicit degree statement** with clear graduation:
+   - "earned [degree] from [institution] in [year]"
+   - "graduated from [institution] with [degree]"
+   - "received PhD/MS/BS from [institution]"
+   - NOTE: "began studying" or "attended" alone = NOT sufficient for Alumni (use Attended)
+   
+3. **Explicit employment title** from authoritative source:
+   - "Professor of [X] at [institution]"
+   - "President of [institution]"
+   - "Dean of [school] at [institution]"
+   - NOTE: "associated with" or "research group from" = NOT sufficient
 
-NOT valid:
-- Honorary degrees (unless also employed/studied there)
-- Guest lectures (unless also employed/studied there)
-- News mentions without employment or education
+4. **Official biography/CV** clearly stating their role
 
-Connection Type Categories:
-- **Alumni**: Graduated with a degree
-- **Attended**: Studied but unclear if graduated
-- **Executive**: Administrator, president, dean, director
-- **Faculty**: Professor, instructor, lecturer
-- **Postdoc**: Postdoctoral researcher
-- **Staff**: Researcher, technician, support staff
-- **Other**: Official connection not covered above
-- **Others**: ONLY if NO connection (connected = "N")
+═══════════════════════════════════════════════════════════════════════
+AUTOMATIC REJECTIONS - These are NOT connections (mark as "N"):
+═══════════════════════════════════════════════════════════════════════
 
-Current vs Past:
-- **PAST**: Alumni (degree in past), former employee, past tense
-- **CURRENT**: Currently employed/studying, present tense
-- Note: Alumni is ALWAYS "past" (degree was earned in the past)
+❌ **One-time event participation** (VERY COMMON FALSE POSITIVE):
+   - "Axelrod Lecturer" = invited lecture, NOT employment
+   - "Distinguished Lecture presenter" = one-time talk, NOT faculty
+   - "keynote speaker" = guest, NOT affiliation
+   - "gave a talk at" = visitor, NOT employee
+   - "symposium participant" = attendee, NOT connection
+   
+❌ **Press/publication relationship**:
+   - "Purdue University Press prize winner" = published BY them, NOT employed
+   - "Lucia Perillo Prize" = award, NOT connection
+   - "editor for [institution] journal" = often external, NOT staff
+   
+❌ **External advisory/board roles**:
+   - "Board of Trustees of [X Institute] at Purdue" = external org board, NOT Purdue employment
+   - "Alfred E. Mann Foundation" = partner organization, NOT Purdue
+   - Must be Purdue's OWN board, not a partner's
+   
+❌ **Weak inference without explicit statement**:
+   - "research group drawn from Purdue" = doesn't mean the PERSON worked there
+   - "collaborated with Purdue researchers" = collaboration ≠ employment
+   - "connected to Purdue" = vague, need explicit role
+   
+❌ **Joint campuses (unless ACCEPT_JOINT_CAMPUSES policy)**:
+   - IUPUI = Indiana University-Purdue University Indianapolis (joint IU campus)
+   - IUPFW = Indiana University-Purdue University Fort Wayne (joint IU campus)
+   - These are NOT Purdue main campus - REJECT unless policy allows
+   
+❌ **Wrong person / name ambiguity**:
+   - Common names (John Smith) without distinguishing details
+   - Check credentials, middle names, field match
+   
+❌ **Honorary degrees alone** (unless also employed/earned degree)
+❌ **News mentions** without explicit role
+❌ **Wikipedia/Alchetron/Medium** as ONLY source (unreliable alone)
 
-**IMPORTANT**: Before saying "N", double-check you read ALL {max_results} results above.
+═══════════════════════════════════════════════════════════════════════
+VALID CONNECTION TYPES - Only use when explicitly stated:
+═══════════════════════════════════════════════════════════════════════
+
+✓ **Alumni**: Graduated with explicit degree ("earned PhD from", "graduated with BS")
+✓ **Attended**: Studied but no confirmed graduation ("began studying", "attended courses")
+✓ **Executive**: President, Provost, Dean, Director (with explicit title)
+✓ **Faculty**: Professor, Instructor, Lecturer (with explicit title, NOT guest lecture)
+✓ **Postdoc**: Postdoctoral position (explicit)
+✓ **Staff**: Researcher, technician, employee (explicit)
+✓ **Visiting**: Visiting Professor/Scholar with formal appointment (NOT one-time lecture)
+✓ **Other**: Other verified official connection
+
+For connected="N", use "Others" as connection_type.
+
+═══════════════════════════════════════════════════════════════════════
+TEMPORAL CLASSIFICATION - Use explicit dates:
+═══════════════════════════════════════════════════════════════════════
+
+**CURRENT** requires ONE of:
+- Present tense: "is a professor", "serves as"
+- Listed on current official page (check date)
+- Recent year {current_year} or {prior_year} mentioned
+
+**PAST** indicators:
+- Past tense: "was a", "served as", "former"
+- End date: "2015-2018", "until 2020"
+- Alumni (degrees are always past)
+- Single past event (2001 lecture = past, NOT current)
+
+When unsure → use "past" (more conservative)
+
+═══════════════════════════════════════════════════════════════════════
+CONFIDENCE LEVELS - Be strict:
+═══════════════════════════════════════════════════════════════════════
+
+**HIGH** - Only for:
+- Official .edu page from the institution
+- Explicit degree with year from reliable source
+- Current faculty directory listing
+
+**MEDIUM** - For:
+- Good secondary source (news, reliable bio) with explicit statement
+- Past employment with clear dates
+- Alumni with good evidence but not official page
+
+**LOW** - For:
+- Weak or unclear evidence
+- Conflicting information
+- Unreliable sources as primary evidence
+- When marking "N" (no connection)
+
+═══════════════════════════════════════════════════════════════════════
+DECISION PROCESS:
+═══════════════════════════════════════════════════════════════════════
+
+1. Read ALL {max_results} results carefully
+2. Look for EXPLICIT evidence (not inference)
+3. Check if person matches (name, field, timing)
+4. Verify NOT a false positive pattern (event, press, external board, etc.)
+5. If doubt → mark "N" (be conservative)
+6. Use BEST source for supporting_url (prefer official .edu)
 
 Required JSON format (no markdown, just JSON):
 {{{{
   "connected": "Y" or "N",
-  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Other" or "Others",
-  "connection_detail": "Specific evidence from search results",
+  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Visiting" or "Other" or "Others",
+  "connection_detail": "Specific evidence from search results with explicit quote if possible",
   "current_or_past": "current" or "past" or "N/A",
-  "supporting_url": "URL from search results",
+  "supporting_url": "Best URL from search results (prefer official .edu)",
   "confidence": "high" or "medium" or "low",
-  "temporal_evidence": "Dates/years from results"
+  "temporal_evidence": "Explicit dates/years from results, or 'unknown' if none"
 }}}}"""
 
 DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=15, sock_read=150)
@@ -131,6 +214,10 @@ YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
 DATE_RANGE_PATTERN = re.compile(r'\b(\d{4})\s*[-–—]\s*(\d{4})\b')
 # Pattern for "from X to Y"
 FROM_TO_PATTERN = re.compile(r'\bfrom\s+(\d{4})\s+to\s+(\d{4})\b', re.IGNORECASE)
+# Pattern for "since X" or "starting X"
+SINCE_PATTERN = re.compile(r'\b(?:since|starting|began\s+in|started\s+in)\s+(\d{4})\b', re.IGNORECASE)
+# Pattern for "until X" or "through X"
+UNTIL_PATTERN = re.compile(r'\b(?:until|through|ended\s+in|retired\s+in|left\s+in)\s+(\d{4})\b', re.IGNORECASE)
 
 
 async def get_session() -> aiohttp.ClientSession:
@@ -214,9 +301,8 @@ def _normalize_connection_type(value: Any, connected: str) -> str:
         "faculty": "Faculty",
         "postdoc": "Postdoc",
         "staff": "Staff",
-        "other": "Other",
-        "others": "Others"
-    }
+        "visiting": "Visiting",
+        "other": "Other"}
     
     text_lower = text.lower()
     if text_lower in valid_types:
@@ -235,6 +321,8 @@ def _normalize_connection_type(value: Any, connected: str) -> str:
         return "Executive"
     if "staff" in text_lower or "researcher" in text_lower or "scientist" in text_lower:
         return "Staff"
+    if "visit" in text_lower:
+        return "Visiting"
     
     # Default to "Other" for connected cases with unclear type
     return "Other"
@@ -409,6 +497,7 @@ def _build_prompt(name: str, institution: str, results: List[Dict[str, Any]]) ->
     return PROMPT_TEMPLATE.format(
         current_date=now.strftime("%B %d, %Y"),
         current_year=now.year,
+        prior_year=now.year - 1,
         name=name,
         institution=institution,
         search_findings=findings,
@@ -663,23 +752,110 @@ def _extract_years(text: str) -> List[int]:
     return [int(m.group(0)) for m in YEAR_PATTERN.finditer(text)]
 
 
-def _has_end_date(text: str, current_year: int) -> bool:
-    """Check if text contains evidence of an ended position (past tense)."""
-    # Check for date ranges that ended in the past
+def _extract_date_ranges(text: str) -> List[tuple[int, int]]:
+    """Extract date ranges from text."""
+    ranges = []
+    
+    # Pattern 1: "2010-2015"
     for match in DATE_RANGE_PATTERN.finditer(text):
         start_year = int(match.group(1))
         end_year = int(match.group(2))
-        if end_year < current_year - 1:  # Ended more than 1 year ago
-            return True
+        ranges.append((start_year, end_year))
     
-    # Check for "from X to Y" patterns
+    # Pattern 2: "from 2010 to 2015"
     for match in FROM_TO_PATTERN.finditer(text):
         start_year = int(match.group(1))
         end_year = int(match.group(2))
-        if end_year < current_year - 1:
-            return True
+        ranges.append((start_year, end_year))
+    
+    return ranges
+
+
+def _extract_temporal_bounds(text: str) -> tuple[Optional[int], Optional[int]]:
+    """Extract start and end years from text.
+    
+    Returns:
+        (start_year, end_year) where None means unbounded
+    """
+    start_year = None
+    end_year = None
+    
+    # Look for "since X"
+    since_matches = list(SINCE_PATTERN.finditer(text))
+    if since_matches:
+        start_year = int(since_matches[-1].group(1))  # Most recent mention
+    
+    # Look for "until X"
+    until_matches = list(UNTIL_PATTERN.finditer(text))
+    if until_matches:
+        end_year = int(until_matches[-1].group(1))  # Most recent mention
+    
+    # Look for explicit ranges
+    ranges = _extract_date_ranges(text)
+    if ranges:
+        # Use the most recent/relevant range
+        most_recent_range = max(ranges, key=lambda r: r[1])  # Range with latest end year
+        if start_year is None:
+            start_year = most_recent_range[0]
+        if end_year is None:
+            end_year = most_recent_range[1]
+    
+    return start_year, end_year
+
+
+def _has_end_date(text: str, current_year: int) -> bool:
+    """Check if text contains evidence of an ended position (past tense)."""
+    _, end_year = _extract_temporal_bounds(text)
+    
+    if end_year and end_year < current_year - 1:
+        return True
     
     return False
+
+
+def _infer_temporal_status(text: str, current_year: int) -> Optional[str]:
+    """Infer if position is current or past based on dates in text.
+    
+    Returns:
+        "current", "past", or None if unclear
+    """
+    start_year, end_year = _extract_temporal_bounds(text)
+    
+    # If we have an explicit end date in the past, it's past
+    if end_year and end_year < current_year - 1:
+        return "past"
+    
+    # If we have a recent end date (last year or this year), it might still be current
+    # unless there's explicit "former" language
+    if end_year and end_year >= current_year - 1:
+        # Check for past tense indicators
+        if _contains_any(text.lower(), PAST_TERMS):
+            return "past"
+        return "current"
+    
+    # If we have only a start date with no end date
+    if start_year and not end_year:
+        # If start is recent (within last 15 years), assume current unless past language
+        if start_year >= current_year - 15:
+            if _contains_any(text.lower(), PAST_TERMS):
+                return "past"
+            return "current"
+        else:
+            # Old start date with no end date - likely past
+            return "past"
+    
+    # If we have a recent year mention
+    all_years = _extract_years(text)
+    if all_years:
+        most_recent = max(all_years)
+        if most_recent >= current_year - 1:
+            # Recent year, check for temporal language
+            if _contains_any(text.lower(), CURRENT_TERMS):
+                return "current"
+            elif _contains_any(text.lower(), PAST_TERMS):
+                return "past"
+    
+    return None  # Unclear
 
 
 def _count_temporal_signals(text: str, terms: List[str]) -> int:
@@ -691,17 +867,102 @@ def _count_temporal_signals(text: str, terms: List[str]) -> int:
     return count
 
 
+def _score_url_quality(url: str, domain: str) -> str:
+    """Score the quality/reliability of a source URL.
+    
+    Returns:
+        "high", "medium", or "low"
+    """
+    url_lower = url.lower()
+    domain_lower = domain.lower()
+    
+    # HIGH quality: Official institutional pages
+    if domain_lower.endswith('.edu'):
+        # Faculty pages, department pages, official directories
+        high_quality_paths = [
+            '/faculty/', '/people/', '/staff/', '/directory/', '/profile/',
+            '/about/people', '/about/faculty', '/dept/', '/department/',
+            '/academics/faculty', '/our-faculty', '/our-people'
+        ]
+        if any(path in url_lower for path in high_quality_paths):
+            return "high"
+        
+        # News pages from .edu domains are also high quality
+        if '/news/' in url_lower or '/newsroom/' in url_lower:
+            return "high"
+        
+        # Other .edu pages are still high quality by default
+        return "high"
+    
+    # LOW quality: Known unreliable or user-generated content sites
+    low_quality_domains = [
+        'alchetron.com',
+        'prabook.com',
+        'everipedia.org',
+        'medium.com',  # Generic Medium posts (not official org Medium)
+        'linkedin.com',  # LinkedIn is self-reported
+        'facebook.com',
+        'twitter.com',
+        'reddit.com',
+        'quora.com',
+        'answers.com',
+        'fandom.com',
+        'wikia.com'
+    ]
+    
+    if any(low_domain in domain_lower for low_domain in low_quality_domains):
+        return "low"
+    
+    # MEDIUM quality: Wikipedia and other generally reliable sources
+    medium_quality_domains = [
+        'wikipedia.org',
+        'en.wikipedia.org',
+        'britannica.com',
+        'scholar.google.com',
+        'researchgate.net',
+        'semanticscholar.org',
+        'orcid.org'
+    ]
+    
+    if any(med_domain in domain_lower for med_domain in medium_quality_domains):
+        return "medium"
+    
+    # News organizations (generally medium-high quality)
+    news_indicators = [
+        'news', 'times', 'post', 'journal', 'tribune', 'herald',
+        'reuters', 'ap.org', 'bbc.', 'npr.org', 'pbs.org',
+        'nytimes', 'wsj.com', 'washingtonpost'
+    ]
+    
+    if any(indicator in domain_lower or indicator in url_lower for indicator in news_indicators):
+        return "medium"
+    
+    # Government and official organization sites
+    if domain_lower.endswith('.gov') or domain_lower.endswith('.org'):
+        return "medium"
+    
+    # Default: medium-low
+    return "medium"
+
+
 def _postprocess_decision(
     name: str,
     institution: str,
     results: List[Dict[str, Any]],
     decision: Dict[str, str],
 ) -> Dict[str, str]:
-    """Improve current/past classification using search result analysis.
+    """Improve current/past classification and confidence using search result analysis.
     
+    Now includes source quality assessment to adjust confidence.
     Note: Only override LLM with VERY STRONG evidence to maintain consistency.
     """
     try:
+        # Force LOW confidence for all N decisions
+        if decision and decision.get("connected") == "N":
+            if decision.get("confidence", "").lower() != "low":
+                decision = dict(decision)
+                decision["confidence"] = "low"
+        
         if not decision or decision.get("connected") != "Y":
             return decision
 
@@ -709,12 +970,13 @@ def _postprocess_decision(
         target_domain = _institution_domain_guess(institution)
         current_year = datetime.utcnow().year
 
-        # Collect evidence from search results
+        # Collect evidence from search results with enhanced date analysis
         target_current_count = 0
         target_past_count = 0
         other_current_edu_urls: List[str] = []
         target_urls_with_end_dates: List[str] = []
         target_recent_years: List[int] = []
+        inferred_temporal_statuses: List[str] = []
 
         for item in results or []:
             title = _safe_text(item.get("title"))
@@ -737,6 +999,11 @@ def _postprocess_decision(
                 target_current_count += current_signals
                 target_past_count += past_signals
                 
+                # Use enhanced date extraction
+                inferred_status = _infer_temporal_status(text, current_year)
+                if inferred_status:
+                    inferred_temporal_statuses.append(inferred_status)
+                
                 # Check for date ranges indicating ended position
                 if _has_end_date(text, current_year):
                     target_urls_with_end_dates.append(url)
@@ -750,13 +1017,23 @@ def _postprocess_decision(
                 if is_edu and _count_temporal_signals(text, CURRENT_TERMS) > 0:
                     other_current_edu_urls.append(url)
 
-        # Decision logic: ONLY override LLM with VERY STRONG evidence (raised thresholds)
+        # Decision logic: Use date-based inference + temporal signals
         current_classification = decision.get("current_or_past", "current")
         
-        # Rule 1: If LLM says current, but we have VERY STRONG past signals
+        # Count inferred statuses
+        inferred_current = inferred_temporal_statuses.count("current")
+        inferred_past = inferred_temporal_statuses.count("past")
+        
+        # Rule 1: If LLM says current, but we have VERY STRONG past evidence
         if current_classification == "current":
-            # Need VERY strong evidence to override (increased thresholds)
-            if target_past_count >= 5 or len(target_urls_with_end_dates) >= 3 or len(other_current_edu_urls) >= 3:
+            # Strong past evidence: multiple date-based indicators
+            strong_past_evidence = (
+                len(target_urls_with_end_dates) >= 2 or  # Multiple ended positions
+                inferred_past >= 3 or  # Multiple results infer past
+                (inferred_past >= 2 and len(other_current_edu_urls) >= 2)  # Past + elsewhere
+            )
+            
+            if strong_past_evidence:
                 updated = dict(decision)
                 updated["current_or_past"] = "past"
                 conf = updated.get("confidence", "medium").lower()
@@ -764,20 +1041,26 @@ def _postprocess_decision(
                     updated["confidence"] = "medium"
                 
                 evidence = updated.get("temporal_evidence", "").strip()
-                if target_past_count >= 5:
-                    extra = f"Very strong past-tense indicators found ({target_past_count} signals)"
-                elif len(target_urls_with_end_dates) >= 3:
-                    extra = "Position clearly ended based on multiple date ranges"
+                if len(target_urls_with_end_dates) >= 2:
+                    extra = f"Position clearly ended based on dates in {len(target_urls_with_end_dates)} sources"
+                elif inferred_past >= 3:
+                    extra = f"Strong date-based evidence of past affiliation ({inferred_past} sources)"
                 else:
-                    extra = "Strong evidence of current affiliation with another institution"
+                    extra = "Evidence shows past affiliation and current position elsewhere"
                 
                 updated["temporal_evidence"] = f"{evidence}; {extra}" if evidence else extra
                 return updated
         
-        # Rule 2: If LLM says past, but we have VERY STRONG current signals
+        # Rule 2: If LLM says past, but we have VERY STRONG current evidence
         elif current_classification == "past":
-            # Need VERY strong evidence to override (increased thresholds)
-            if (target_current_count >= 5 and target_current_count > target_past_count + 2) or len(target_recent_years) >= 3:
+            # Strong current evidence: multiple recent indicators
+            strong_current_evidence = (
+                len(target_recent_years) >= 3 or  # Multiple recent year mentions
+                inferred_current >= 3 or  # Multiple results infer current
+                (inferred_current >= 2 and target_current_count >= 5)  # Inference + signals
+            )
+            
+            if strong_current_evidence:
                 updated = dict(decision)
                 updated["current_or_past"] = "current"
                 
@@ -785,11 +1068,46 @@ def _postprocess_decision(
                 if len(target_recent_years) >= 3:
                     years_str = ", ".join(str(y) for y in sorted(set(target_recent_years))[:3])
                     extra = f"Strong recent activity found ({years_str})"
+                elif inferred_current >= 3:
+                    extra = f"Multiple sources ({inferred_current}) indicate current affiliation"
                 else:
-                    extra = f"Very strong current indicators ({target_current_count} signals vs {target_past_count} past)"
+                    extra = f"Strong current indicators with recent dates"
                 
                 updated["temporal_evidence"] = f"{evidence}; {extra}" if evidence else extra
                 return updated
+
+        # NEW: Source quality-based confidence adjustment
+        # Score the quality of the supporting_url
+        supporting_url = decision.get("supporting_url", "")
+        if supporting_url and decision.get("connected") == "Y":
+            domain = _extract_domain(supporting_url)
+            url_quality = _score_url_quality(supporting_url, domain)
+            current_confidence = decision.get("confidence", "medium").lower()
+            
+            # Downgrade confidence based on source quality
+            if url_quality == "low":
+                # LOW quality sources: max confidence is "low"
+                if current_confidence in ["high", "medium"]:
+                    updated = dict(decision)
+                    updated["confidence"] = "low"
+                    return updated
+            
+            elif url_quality == "medium":
+                # MEDIUM quality sources: max confidence is "medium"
+                if current_confidence == "high":
+                    # Check if we have multiple high-quality sources
+                    high_quality_count = sum(
+                        1 for r in results or []
+                        if _score_url_quality(r.get("url", ""), _extract_domain(r.get("url", ""))) == "high"
+                    )
+                    # Only keep "high" if we have 2+ high-quality sources
+                    if high_quality_count < 2:
+                        updated = dict(decision)
+                        updated["confidence"] = "medium"
+                        return updated
+            
+            # If url_quality == "high" and it's a .edu, we can keep high confidence
+            # But ONLY if the connection_detail has explicit evidence (checked by LLM prompt)
 
         return decision
     except Exception:
@@ -813,7 +1131,7 @@ def _validate_decision(decision: Dict[str, str], name: str, institution: str) ->
     
     # Validate connection_type
     connection_type = decision.get("connection_type", "")
-    valid_connection_types = ["Alumni", "Attended", "Executive", "Faculty", "Postdoc", "Staff", "Other", "Others"]
+    valid_connection_types = ["Alumni", "Attended", "Executive", "Faculty", "Postdoc", "Staff", "Visiting", "Other", "Others"]
     if connection_type not in valid_connection_types:
         return False
     
@@ -841,6 +1159,146 @@ def _validate_decision(decision: Dict[str, str], name: str, institution: str) ->
         return False
     
     return True
+
+
+def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict[str, Any]]) -> Optional[str]:
+    """Detect common false positive patterns and AUTO-REJECT them.
+    
+    This function will CHANGE connected="Y" to "N" for obvious false positives.
+    
+    Returns:
+        Rejection reason if a false positive pattern is detected, None otherwise
+    """
+    if decision.get("connected") != "Y":
+        return None  # Only check positive connections
+    
+    detail = decision.get("connection_detail", "").lower()
+    connection_type = decision.get("connection_type", "")
+    
+    # Collect all text for pattern matching
+    all_text = detail + " "
+    for result in results or []:
+        title = _safe_text(result.get("title", "")).lower()
+        snippet = _safe_text(result.get("snippet", "")).lower()
+        all_text += f" {title} {snippet}"
+    
+    # Pattern 1: Event participation (HIGHEST PRIORITY - very common false positive)
+    event_terms = [
+        "keynote", "speaker", "gave talk", "gave a talk", "presented at", "symposium",
+        "conference", "workshop", "seminar", "guest lecture", "distinguished lecture",
+        "axelrod", "lecture series", "colloquium", "invited talk", "talk at"
+    ]
+    for term in event_terms:
+        if term in detail or term in all_text:
+            # Unless it's explicitly a Visiting appointment with formal term
+            if connection_type != "Visiting" and "visiting professor" not in detail and "visiting scholar" not in detail:
+                # AUTO-REJECT
+                decision["connected"] = "N"
+                decision["connection_type"] = "Others"
+                decision["connection_detail"] = f"REJECTED: Event participation ({term}) is not an official connection"
+                decision["confidence"] = "low"
+                return f"AUTO-REJECTED: Event participation detected ({term})"
+    
+    # Pattern 2: Press/publication prizes
+    press_prize_terms = [
+        "press prize", "press award", "prize winner", "prize from", "award from"
+    ]
+    for term in press_prize_terms:
+        if term in detail:
+            # Check if it's ONLY about prize, not actual employment
+            employment_terms = ["professor", "faculty", "staff", "employee", "worked", "teaches", "graduated", "degree from"]
+            if not any(emp_term in detail for emp_term in employment_terms):
+                # AUTO-REJECT
+                decision["connected"] = "N"
+                decision["connection_type"] = "Others"
+                decision["connection_detail"] = f"REJECTED: Press/publication prize ({term}) is not an affiliation"
+                decision["confidence"] = "low"
+                return f"AUTO-REJECTED: Press prize detected ({term})"
+    
+    # Pattern 3: Publishing relationships
+    publishing_terms = [
+        "published by", "publisher", "editor for", "guest editor", "editorial board of",
+        "edited by", "book series", "journal of"
+    ]
+    for term in publishing_terms:
+        if term in detail:
+            # Check if it's ONLY about publishing, not actual employment
+            employment_terms = ["professor", "faculty", "staff", "employee", "worked", "teaches", "graduated", "degree from"]
+            if not any(emp_term in detail for emp_term in employment_terms):
+                # AUTO-REJECT
+                decision["connected"] = "N"
+                decision["connection_type"] = "Others"
+                decision["connection_detail"] = f"REJECTED: Publishing relationship ({term}) is not an affiliation"
+                decision["confidence"] = "low"
+                return f"AUTO-REJECTED: Publishing relationship detected ({term})"
+    
+    # Pattern 4: External advisory roles / External boards
+    external_board_terms = [
+        "board of trustees of", "board of directors of", "board member of",
+        "advisory board for", "external review", "consultant for",
+        "advisory committee for", "foundation board", "institute board"
+    ]
+    for term in external_board_terms:
+        if term in detail:
+            # Check if it's an external organization's board (e.g., "Board of X at Purdue" where X is external org)
+            external_org_indicators = ["foundation", "institute at", "center at", "board of trustees of"]
+            if any(indicator in detail for indicator in external_org_indicators):
+                # AUTO-REJECT
+                decision["connected"] = "N"
+                decision["connection_type"] = "Others"
+                decision["connection_detail"] = f"REJECTED: External organization board ({term}) is not institutional employment"
+                decision["confidence"] = "low"
+                return f"AUTO-REJECTED: External board detected ({term})"
+    
+    # Pattern 5: Weak inference without explicit statement
+    weak_inference_terms = [
+        "connected to", "associated with", "linked to", "related to",
+        "research group drawn from", "research group from", "team from",
+        "drawn from researchers at"
+    ]
+    for term in weak_inference_terms:
+        if term in detail:
+            # Check if there's an explicit statement of employment or degree
+            explicit_terms = [
+                "professor at", "faculty at", "graduated from", "degree from",
+                "earned", "received", "employed at", "works at", "president of",
+                "dean of", "director of"
+            ]
+            if not any(explicit_term in detail for explicit_term in explicit_terms):
+                # AUTO-REJECT
+                decision["connected"] = "N"
+                decision["connection_type"] = "Others"
+                decision["connection_detail"] = f"REJECTED: Weak inference ({term}) without explicit employment/degree statement"
+                decision["confidence"] = "low"
+                return f"AUTO-REJECTED: Weak inference detected ({term})"
+    
+    # Pattern 6: Joint campus mentions (IUPUI/IUPFW)
+    from .config import JOINT_CAMPUS_PATTERNS, ACCEPT_JOINT_CAMPUSES
+    if not ACCEPT_JOINT_CAMPUSES:
+        if any(pattern in all_text for pattern in JOINT_CAMPUS_PATTERNS):
+            # Check if it's clearly IUPUI/IUPFW vs Purdue main
+            if "iupui" in all_text or "iupfw" in all_text:
+                # AUTO-REJECT
+                decision["connected"] = "N"
+                decision["connection_type"] = "Others"
+                decision["connection_detail"] = "REJECTED: IUPUI/IUPFW is a joint IU-Purdue campus, not Purdue main campus"
+                decision["confidence"] = "low"
+                return "AUTO-REJECTED: Joint campus (IUPUI/IUPFW) detected"
+    
+    # Pattern 7: Honorary degrees (without other connections)
+    honorary_terms = ["honorary degree", "honorary doctorate", "honoris causa"]
+    if any(term in detail for term in honorary_terms):
+        # Check if there's mention of actual study or employment
+        genuine_terms = ["earned degree", "phd from", "bachelor from", "master from", "graduated", "professor", "faculty", "employed"]
+        if not any(term in detail for term in genuine_terms):
+            # AUTO-REJECT
+            decision["connected"] = "N"
+            decision["connection_type"] = "Others"
+            decision["connection_detail"] = "REJECTED: Honorary degree alone is not an earned degree or employment"
+            decision["confidence"] = "low"
+            return "AUTO-REJECTED: Honorary degree only"
+    
+    return None
 
 
 async def analyze_connection(
@@ -903,6 +1361,20 @@ async def analyze_connection(
             
             # Post-process with relaxed override thresholds
             decision = _postprocess_decision(name, institution, results or [], decision)
+            
+            # Check for false positive patterns
+            warning = _detect_false_positive_patterns(decision, results or [])
+            if warning:
+                if debug:
+                    print(f"[LLM] {warning}")
+                # Add warning to temporal_evidence for user visibility
+                existing_evidence = decision.get("temporal_evidence", "")
+                decision["temporal_evidence"] = f"{existing_evidence}; {warning}" if existing_evidence else warning
+                # Reduce confidence if high
+                if decision.get("confidence") == "high":
+                    decision["confidence"] = "medium"
+                    if debug:
+                        print(f"[LLM] Reduced confidence to medium due to false positive pattern")
             
             if debug:
                 print(f"[LLM] Analysis complete: {decision}")

@@ -2,6 +2,7 @@ import asyncio
 import random
 import re
 import shutil
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
@@ -10,7 +11,13 @@ from urllib.parse import quote, urlparse, urlsplit, urlunsplit, parse_qsl, urlen
 import httpx
 from bs4 import BeautifulSoup
 
-from .config import BROWSER_ARGS
+try:
+    import ftfy
+    FTFY_AVAILABLE = True
+except ImportError:
+    FTFY_AVAILABLE = False
+
+from .config import BROWSER_ARGS, ACCEPT_JOINT_CAMPUSES, JOINT_CAMPUS_PATTERNS
 
 try:
     from pyppeteer import launch
@@ -170,8 +177,88 @@ def _compose_query(*parts: str) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+def _fix_text_encoding(text: str) -> str:
+    """Fix mojibake and encoding errors in text using ftfy.
+    
+    Examples:
+        "Câˆšâ‰¥rdova" -> "Córdova"
+        "FranÃ§ois" -> "François"
+    
+    Args:
+        text: Text that may contain encoding errors
+        
+    Returns:
+        Fixed text with proper Unicode characters
+    """
+    if not text:
+        return text
+    
+    # If ftfy is available, use it to fix encoding issues
+    if FTFY_AVAILABLE:
+        try:
+            fixed = ftfy.fix_text(text)
+            # Only return the fixed version if it's actually different and looks better
+            # (ftfy is conservative and won't change text unless it's clearly broken)
+            return fixed
+        except Exception:
+            # If ftfy fails, return original text
+            return text
+    
+    # Fallback if ftfy is not available: just return the text as-is
+    return text
+
+
 def _normalise_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _remove_diacritics(text: str) -> str:
+    """Remove diacritical marks from text for fuzzy matching."""
+    # Normalize to NFD (decomposed form) then filter out combining characters
+    nfd = unicodedata.normalize('NFD', text)
+    return ''.join(char for char in nfd if unicodedata.category(char) != 'Mn')
+
+
+def _normalize_name_for_matching(name: str) -> str:
+    """Normalize a name for flexible matching: lowercase, no diacritics, no punctuation."""
+    # First fix any encoding errors
+    normalized = _fix_text_encoding(name)
+    normalized = _normalise_whitespace(normalized).lower()
+    # Remove diacritics
+    normalized = _remove_diacritics(normalized)
+    # Remove punctuation except spaces
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    # Collapse multiple spaces
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized
+
+
+def _extract_name_components(person_name: str) -> Dict[str, List[str]]:
+    """Extract first, middle, and last name components with variations."""
+    normalized = _normalize_name_for_matching(person_name)
+    tokens = [token for token in normalized.split() if token and len(token) > 0]
+    
+    if not tokens:
+        return {"first": [], "middle": [], "last": [], "initials": []}
+    
+    components = {
+        "first": [tokens[0]] if len(tokens) > 0 else [],
+        "middle": tokens[1:-1] if len(tokens) > 2 else [],
+        "last": [tokens[-1]] if len(tokens) > 1 else [],
+        "initials": []
+    }
+    
+    # Add middle initials
+    for middle in components["middle"]:
+        if middle:
+            components["initials"].append(middle[0])
+    
+    # If only one token, it might be last name only
+    if len(tokens) == 1:
+        components["last"] = [tokens[0]]
+        components["first"] = []
+    
+    return components
 
 
 def _quote_clause(text: str) -> str:
@@ -226,23 +313,66 @@ def _ensure_name_and_institution(query: str, person_name: str, institution: str)
 
 
 def _name_matches(text: str, person_name: str) -> bool:
-    normalized = _normalise_whitespace(person_name).lower()
-    if not normalized:
+    """Enhanced name matching with support for:
+    - Middle name variations (John S. Smith vs John Samuel Smith)
+    - Diacritics (Córdova vs Cordova)
+    - Different name orderings
+    - Initials
+    """
+    # Normalize both text and name for comparison
+    normalized_text = _normalize_name_for_matching(text)
+    normalized_name = _normalize_name_for_matching(person_name)
+    
+    # Quick exact match
+    if normalized_name in normalized_text:
+        return True
+    
+    # Extract name components
+    components = _extract_name_components(person_name)
+    first_names = components["first"]
+    middle_names = components["middle"]
+    last_names = components["last"]
+    middle_initials = components["initials"]
+    
+    if not first_names or not last_names:
+        # If we only have one name part, do simple matching
+        return normalized_name in normalized_text
+    
+    first = first_names[0]
+    last = last_names[0]
+    
+    # Check for first and last name presence
+    if first not in normalized_text or last not in normalized_text:
         return False
-    tokens = [token for token in re.split(r"[^a-z]+", normalized) if token]
-    if not tokens:
-        return False
-    if len(tokens) == 1:
-        return tokens[0] in text
-    first, last = tokens[0], tokens[-1]
-    if first in text and last in text:
+    
+    # At this point, we have both first and last name
+    # Now check for middle name/initial variations
+    
+    # Pattern 1: First Middle Last
+    for middle in middle_names:
+        full_pattern = f"{first} {middle} {last}"
+        if full_pattern in normalized_text:
+            return True
+    
+    # Pattern 2: First M. Last (middle initial with period)
+    for initial in middle_initials:
+        initial_pattern = f"{first} {initial} {last}"
+        # Use regex to match optional period after initial
+        pattern = re.compile(rf'\b{re.escape(first)}\s+{re.escape(initial)}\.?\s+{re.escape(last)}\b')
+        if pattern.search(normalized_text):
+            return True
+    
+    # Pattern 3: First Last (no middle)
+    # Be more strict here - require word boundaries
+    pattern = re.compile(rf'\b{re.escape(first)}\s+{re.escape(last)}\b')
+    if pattern.search(normalized_text):
         return True
-    pattern = re.compile(rf"{re.escape(first)}\s+[a-z]\.\s*{re.escape(last)}")
-    if pattern.search(text):
+    
+    # Pattern 4: Last, First (reversed with comma)
+    reversed_pattern = f"{last} {first}"  # Sometimes comma is stripped
+    if reversed_pattern in normalized_text:
         return True
-    pattern = re.compile(rf"{re.escape(first)}\s+[a-z]+\s+{re.escape(last)}")
-    if pattern.search(text):
-        return True
+    
     return False
 
 def _normalise_url(raw_url: str) -> str:
@@ -271,6 +401,53 @@ def _normalise_url(raw_url: str) -> str:
     return normalized.rstrip("/")
 
 
+def _resolve_bing_redirect(url: str) -> str:
+    """Resolve Bing redirect URLs to actual target URLs.
+    
+    Bing often uses redirect URLs like:
+    - https://www.bing.com/ck/a?!&&p=...&u=<encoded_url>
+    - Extract the actual target URL from the 'u' parameter
+    """
+    if not url:
+        return url
+    
+    try:
+        parsed = urlparse(url)
+        
+        # Check if this is a Bing redirect
+        if 'bing.com' in parsed.netloc.lower() and '/ck/a' in parsed.path.lower():
+            # Parse query parameters
+            params = dict(parse_qsl(parsed.query))
+            
+            # Look for the 'u' parameter which contains the actual URL
+            if 'u' in params:
+                actual_url = params['u']
+                # The URL might be base64 encoded or URL encoded
+                # Try to decode and normalize
+                try:
+                    # First try URL decoding
+                    from urllib.parse import unquote
+                    decoded = unquote(actual_url)
+                    
+                    # Validate it's a proper URL
+                    test_parsed = urlparse(decoded)
+                    if test_parsed.scheme in {'http', 'https'} and test_parsed.netloc:
+                        return _normalise_url(decoded)
+                except Exception:
+                    pass
+        
+        # If not a redirect or couldn't resolve, return normalized original
+        return _normalise_url(url)
+    except Exception:
+        return url
+
+
+def _is_joint_campus_mention(text: str) -> bool:
+    """Check if text mentions a joint IU-Purdue campus (IUPUI, IUPFW, etc.)."""
+    text_lower = text.lower()
+    return any(pattern in text_lower for pattern in JOINT_CAMPUS_PATTERNS)
+
+
 def _compute_signals(
     title: str,
     snippet: str,
@@ -289,6 +466,7 @@ def _compute_signals(
     has_transition = _contains_any(text, TRANSITION_TERMS)
     has_recent_year = any(year in text for year in RECENT_YEAR_STRINGS)
     has_timeline = any(str(year) in text for year in YEAR_WINDOW)
+    is_joint_campus = _is_joint_campus_mention(text)
 
     score = 0
     if has_person:
@@ -315,6 +493,10 @@ def _compute_signals(
         score += 1
     if any(site in domain for site in PROFILE_SITES):
         score += 1
+    
+    # Apply penalty for joint campus mentions if not accepting them
+    if is_joint_campus and not ACCEPT_JOINT_CAMPUSES:
+        score = max(0, score - 8)  # Heavy penalty to deprioritize
 
     return {
         "has_person_name": bool(has_person),
@@ -325,6 +507,7 @@ def _compute_signals(
         "has_past": bool(has_past),
         "has_recent_year": bool(has_recent_year),
         "has_timeline": bool(has_timeline),
+        "is_joint_campus": bool(is_joint_campus),
         "domain": domain,
         "relevance_score": score,
     }
@@ -571,7 +754,11 @@ def _parse_result_element(
     url = anchor.get("href", "").strip()
     if not url.startswith(("http://", "https://")):
         return None
+    
+    # Resolve Bing redirects to get actual target URL
+    url = _resolve_bing_redirect(url)
     url = _normalise_url(url)
+    
     title = _normalise_whitespace(anchor.get_text(" ", strip=True))
     if not title:
         return None
@@ -631,7 +818,11 @@ def _extract_results(
             url = anchor.get("href", "").strip()
             if not url.startswith(("http://", "https://")):
                 continue
+            
+            # Resolve Bing redirects
+            url = _resolve_bing_redirect(url)
             url = _normalise_url(url)
+            
             if url in seen_urls:
                 continue
             title = _normalise_whitespace(anchor.get_text(" ", strip=True))
@@ -882,12 +1073,13 @@ async def _execute_strategy(
     return annotated
 
 
-async def enhanced_search(
+async def _enhanced_search_impl(
     name: str,
     institution: str = "",
     num_results: int = 30,
     debug: bool = False,
 ) -> List[Dict[str, object]]:
+    """Internal implementation of enhanced search without timeout wrapper."""
     clean_name = _normalise_whitespace(name)
     if not clean_name:
         return []
@@ -985,6 +1177,37 @@ async def enhanced_search(
     # Wait for any remaining tasks (should be quick or already done)
     await asyncio.gather(*tasks, return_exceptions=True)
 
+    # NEW: Apply source quality boosting/penalties
+    for url, result in combined.items():
+        domain = result.get("url", "").lower()
+        
+        # Boost official .edu domains significantly
+        if ".edu" in domain:
+            # Extra boost for faculty/people pages
+            if any(path in url.lower() for path in ["/faculty/", "/people/", "/staff/", "/directory/", "/profile/"]):
+                result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 30
+            else:
+                # Regular .edu boost
+                result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 20
+        
+        # Penalize low-quality domains
+        low_quality_domains = [
+            "alchetron.com", "prabook.com", "everipedia.org",
+            "medium.com",  # Generic Medium posts
+            "linkedin.com", "facebook.com", "twitter.com"
+        ]
+        if any(low_domain in domain for low_domain in low_quality_domains):
+            # Heavy penalty - reduce score significantly
+            result["signals"]["relevance_score"] = max(0, result["signals"].get("relevance_score", 0) - 25)
+        
+        # Boost reliable sources moderately
+        reliable_sources = [
+            "wikipedia.org", "britannica.com", "researchgate.net",
+            "semanticscholar.org", "scholar.google.com"
+        ]
+        if any(reliable in domain for reliable in reliable_sources):
+            result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 5
+
     ordered = sorted(
         combined.values(),
         key=lambda item: (
@@ -1010,6 +1233,42 @@ async def enhanced_search(
         )
 
     return ordered[:num_results]
+
+
+ENHANCED_SEARCH_TIMEOUT = 45.0  # Maximum time for enhanced search to complete
+
+
+async def enhanced_search(
+    name: str,
+    institution: str = "",
+    num_results: int = 30,
+    debug: bool = False,
+) -> List[Dict[str, object]]:
+    """Execute enhanced search with timeout protection.
+    
+    This wrapper ensures that enhanced_search never takes more than ENHANCED_SEARCH_TIMEOUT
+    seconds, preventing cascading strategy timeouts from blocking the batch.
+    If timeout occurs, falls back to basic search.
+    """
+    try:
+        return await asyncio.wait_for(
+            _enhanced_search_impl(name, institution, num_results, debug),
+            timeout=ENHANCED_SEARCH_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        if debug:
+            print(f"[search] Enhanced search timed out after {ENHANCED_SEARCH_TIMEOUT}s, falling back to basic search")
+        # Fallback to basic search on timeout
+        clean_name = _normalise_whitespace(name)
+        if not clean_name:
+            return []
+        return await bing_search(
+            clean_name,
+            num_results=num_results,
+            institution=institution,
+            person_name=clean_name,
+            debug=debug,
+        )
 
 
 async def force_browser_recreation():

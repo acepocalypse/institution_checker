@@ -1,5 +1,6 @@
 ﻿aiohttp
 beautifulsoup4
+ftfy
 httpx
 pandas
 pyppeteer
