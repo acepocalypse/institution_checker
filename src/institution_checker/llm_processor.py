@@ -16,155 +16,52 @@ _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 _last_refresh_time = 0.0
 
-MAX_RESULTS_FOR_PROMPT = 15  # Increased to provide more context to LLM
+MAX_RESULTS_FOR_PROMPT = 20  # Use all search results to maximize evidence coverage
 
-# STRICT EVIDENCE-BASED PROMPT - Designed to minimize false positives
-PROMPT_TEMPLATE = """Determine if this person has a VERIFIED official connection to the institution.
-
-Person: {name}
-Institution: {institution}
-Current date: {current_date}
-Current year: {current_year}
+# STRICT EVIDENCE-BASED PROMPT - Balanced for speed and accuracy
+PROMPT_TEMPLATE = """Verify if {name} has official connection to {institution}. 
+READ ALL {max_results} RESULTS BELOW - evidence may be in any result.
 
 Search results:
 {search_findings}
 
-═══════════════════════════════════════════════════════════════════════
-CRITICAL: BE EXTREMELY CONSERVATIVE - Default to "N" unless STRONG EXPLICIT EVIDENCE
-═══════════════════════════════════════════════════════════════════════
+REQUIRED EVIDENCE (need ≥1 for "Y"):
+1. Official .edu page: faculty/dept directory, alumni registry, official bio
+2. Explicit degree: "earned PhD from", "graduated from", "received BS from" 
+3. Explicit title: "Professor at", "President of", "Dean of", "worked at"
+4. Official CV/bio clearly stating role and institution
 
-REQUIRED EVIDENCE - Must have AT LEAST ONE:
+VALID EXAMPLES → Mark "Y":
+• "earned his PhD from Stanford" → Alumni, past
+• "is a Professor of Biology at MIT" → Faculty, current  
+• "President of Harvard 2010-2015" → Executive, past
+• "graduated with BS from Purdue" → Alumni, past
 
-1. **Official .edu page from the institution** listing them as faculty/staff/student
-   - Faculty directory page
-   - Department people page
-   - Official student/alumni registry
-   
-2. **Explicit degree statement** with clear graduation:
-   - "earned [degree] from [institution] in [year]"
-   - "graduated from [institution] with [degree]"
-   - "received PhD/MS/BS from [institution]"
-   - NOTE: "began studying" or "attended" alone = NOT sufficient for Alumni (use Attended)
-   
-3. **Explicit employment title** from authoritative source:
-   - "Professor of [X] at [institution]"
-   - "President of [institution]"
-   - "Dean of [school] at [institution]"
-   - NOTE: "associated with" or "research group from" = NOT sufficient
+AUTO-REJECT → Mark "N":
+❌ Events: keynote, Axelrod Lecturer, symposium, distinguished lecture, gave talk, invited speaker
+❌ Press/prizes: "press prize winner", "press award", journal editor (without employment)
+❌ External boards: "Board of [X] at [institution]" where X is external partner org
+❌ Weak inference: "research group from", "associated with", "connected to" (without explicit role)
+❌ Joint campus: IUPUI, IUPFW (unless policy allows)
+❌ Honorary degrees alone (without earned degree or employment)
 
-4. **Official biography/CV** clearly stating their role
+CONNECTION TYPES:
+Alumni (earned degree), Attended (studied, no confirmed degree), Executive (President/Provost/Dean/Director),
+Faculty (Professor/Instructor), Postdoc, Staff (employee/researcher), Visiting (formal appointment),
+Other (verified connection), Others (only if connected="N")
 
-═══════════════════════════════════════════════════════════════════════
-AUTOMATIC REJECTIONS - These are NOT connections (mark as "N"):
-═══════════════════════════════════════════════════════════════════════
+TEMPORAL: Current = "is"/"serves"/present tense/{current_year}-{prior_year} | Past = "was"/"former"/end date/Alumni
+CONFIDENCE: High = .edu + explicit | Medium = reliable source + explicit | Low = weak/N
 
-❌ **One-time event participation** (VERY COMMON FALSE POSITIVE):
-   - "Axelrod Lecturer" = invited lecture, NOT employment
-   - "Distinguished Lecture presenter" = one-time talk, NOT faculty
-   - "keynote speaker" = guest, NOT affiliation
-   - "gave a talk at" = visitor, NOT employee
-   - "symposium participant" = attendee, NOT connection
-   
-❌ **Press/publication relationship**:
-   - "Purdue University Press prize winner" = published BY them, NOT employed
-   - "Lucia Perillo Prize" = award, NOT connection
-   - "editor for [institution] journal" = often external, NOT staff
-   
-❌ **External advisory/board roles**:
-   - "Board of Trustees of [X Institute] at Purdue" = external org board, NOT Purdue employment
-   - "Alfred E. Mann Foundation" = partner organization, NOT Purdue
-   - Must be Purdue's OWN board, not a partner's
-   
-❌ **Weak inference without explicit statement**:
-   - "research group drawn from Purdue" = doesn't mean the PERSON worked there
-   - "collaborated with Purdue researchers" = collaboration ≠ employment
-   - "connected to Purdue" = vague, need explicit role
-   
-❌ **Joint campuses (unless ACCEPT_JOINT_CAMPUSES policy)**:
-   - IUPUI = Indiana University-Purdue University Indianapolis (joint IU campus)
-   - IUPFW = Indiana University-Purdue University Fort Wayne (joint IU campus)
-   - These are NOT Purdue main campus - REJECT unless policy allows
-   
-❌ **Wrong person / name ambiguity**:
-   - Common names (John Smith) without distinguishing details
-   - Check credentials, middle names, field match
-   
-❌ **Honorary degrees alone** (unless also employed/earned degree)
-❌ **News mentions** without explicit role
-❌ **Wikipedia/Alchetron/Medium** as ONLY source (unreliable alone)
-
-═══════════════════════════════════════════════════════════════════════
-VALID CONNECTION TYPES - Only use when explicitly stated:
-═══════════════════════════════════════════════════════════════════════
-
-✓ **Alumni**: Graduated with explicit degree ("earned PhD from", "graduated with BS")
-✓ **Attended**: Studied but no confirmed graduation ("began studying", "attended courses")
-✓ **Executive**: President, Provost, Dean, Director (with explicit title)
-✓ **Faculty**: Professor, Instructor, Lecturer (with explicit title, NOT guest lecture)
-✓ **Postdoc**: Postdoctoral position (explicit)
-✓ **Staff**: Researcher, technician, employee (explicit)
-✓ **Visiting**: Visiting Professor/Scholar with formal appointment (NOT one-time lecture)
-✓ **Other**: Other verified official connection
-
-For connected="N", use "Others" as connection_type.
-
-═══════════════════════════════════════════════════════════════════════
-TEMPORAL CLASSIFICATION - Use explicit dates:
-═══════════════════════════════════════════════════════════════════════
-
-**CURRENT** requires ONE of:
-- Present tense: "is a professor", "serves as"
-- Listed on current official page (check date)
-- Recent year {current_year} or {prior_year} mentioned
-
-**PAST** indicators:
-- Past tense: "was a", "served as", "former"
-- End date: "2015-2018", "until 2020"
-- Alumni (degrees are always past)
-- Single past event (2001 lecture = past, NOT current)
-
-When unsure → use "past" (more conservative)
-
-═══════════════════════════════════════════════════════════════════════
-CONFIDENCE LEVELS - Be strict:
-═══════════════════════════════════════════════════════════════════════
-
-**HIGH** - Only for:
-- Official .edu page from the institution
-- Explicit degree with year from reliable source
-- Current faculty directory listing
-
-**MEDIUM** - For:
-- Good secondary source (news, reliable bio) with explicit statement
-- Past employment with clear dates
-- Alumni with good evidence but not official page
-
-**LOW** - For:
-- Weak or unclear evidence
-- Conflicting information
-- Unreliable sources as primary evidence
-- When marking "N" (no connection)
-
-═══════════════════════════════════════════════════════════════════════
-DECISION PROCESS:
-═══════════════════════════════════════════════════════════════════════
-
-1. Read ALL {max_results} results carefully
-2. Look for EXPLICIT evidence (not inference)
-3. Check if person matches (name, field, timing)
-4. Verify NOT a false positive pattern (event, press, external board, etc.)
-5. If doubt → mark "N" (be conservative)
-6. Use BEST source for supporting_url (prefer official .edu)
-
-Required JSON format (no markdown, just JSON):
+JSON only (no markdown):
 {{{{
   "connected": "Y" or "N",
-  "connection_type": "Alumni" or "Attended" or "Executive" or "Faculty" or "Postdoc" or "Staff" or "Visiting" or "Other" or "Others",
-  "connection_detail": "Specific evidence from search results with explicit quote if possible",
-  "current_or_past": "current" or "past" or "N/A",
-  "supporting_url": "Best URL from search results (prefer official .edu)",
-  "confidence": "high" or "medium" or "low",
-  "temporal_evidence": "Explicit dates/years from results, or 'unknown' if none"
+  "connection_type": "Alumni|Attended|Executive|Faculty|Postdoc|Staff|Visiting|Other|Others",
+  "connection_detail": "Quote explicit evidence",
+  "current_or_past": "current|past|N/A",
+  "supporting_url": "Best URL (prefer .edu)",
+  "confidence": "high|medium|low",
+  "temporal_evidence": "Dates/years or 'unknown'"
 }}}}"""
 
 DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=15, sock_read=150)

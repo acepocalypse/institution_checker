@@ -318,6 +318,25 @@ Alice Johnson
 
 Additional columns are allowed but will be ignored. The tool processes each name in the `name` column.
 
+### Encoding and Special Characters
+
+The tool **automatically fixes encoding errors** (mojibake) in names using the `ftfy` library. This handles common issues like:
+
+- `France A. Câˆšâ‰¥rdova` → automatically fixed to `France A. Córdova`
+- `FranÃ§ois` → automatically fixed to `François`
+- `JosÃ© GarcÃ­a` → automatically fixed to `José García`
+
+**Best practices:**
+- Save CSV files with UTF-8 encoding
+- Names with accents/diacritics are fully supported
+- No manual cleaning needed - automatic repair happens on load
+- See `ENCODING_FIX.md` for technical details
+
+The tool also handles name variations intelligently:
+- Middle name vs. initial: "John S. Smith" matches "John Samuel Smith"
+- Diacritics: "Córdova" matches "Cordova" during search
+- Name order: "Smith, John" matches "John Smith"
+
 ## Evaluation and Validation
 
 The output columns are designed for automated evaluation:

@@ -886,16 +886,15 @@ def _build_strategies(
     institution_clause = _quote_clause(clean_institution)
     institution_fragment = institution_clause or clean_institution
 
-    # OPTIMIZATION: Reduced further - focus on highest-value strategies
-    # Each strategy gets fewer results to reduce time
-    base_limit = max(3, min(4, per_strategy_limit))
+    # Increased limits to ensure we capture true positives
+    base_limit = max(4, min(6, per_strategy_limit))
 
     strategies: List[QueryStrategy] = [
         # Most important: core profile search
         QueryStrategy(
             name="core_profile",
             query=_compose_query(name_clause, institution_fragment),
-            limit=base_limit + 1,  # Slightly higher for most important
+            limit=base_limit + 2,  # Higher for most important
             boost=5,
         ),
         # Current status (high value for current vs past determination)
@@ -920,6 +919,17 @@ def _build_strategies(
             limit=base_limit,
             boost=3,
         ),
+        # Education/degree search (important for alumni connections)
+        QueryStrategy(
+            name="education",
+            query=_compose_query(
+                name_clause,
+                institution_fragment,
+                '("degree" OR "graduated" OR "alumni" OR "PhD" OR "bachelor")',
+            ),
+            limit=base_limit,
+            boost=3,
+        ),
     ]
     
     # Add directory search only if we have institution domain
@@ -935,8 +945,8 @@ def _build_strategies(
                     site_filter,
                     '("faculty" OR "staff" OR "directory")',
                 ),
-                limit=base_limit,
-                boost=3,
+                limit=base_limit + 1,  # Higher for official pages
+                boost=4,  # Higher boost for official domain
             )
         )
 
@@ -1178,6 +1188,7 @@ async def _enhanced_search_impl(
     await asyncio.gather(*tasks, return_exceptions=True)
 
     # NEW: Apply source quality boosting/penalties
+    # Note: Penalties reduced to avoid filtering out good results from top positions
     for url, result in combined.items():
         domain = result.get("url", "").lower()
         
@@ -1188,17 +1199,16 @@ async def _enhanced_search_impl(
                 result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 30
             else:
                 # Regular .edu boost
-                result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 20
+                result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 15
         
-        # Penalize low-quality domains
-        low_quality_domains = [
-            "alchetron.com", "prabook.com", "everipedia.org",
-            "medium.com",  # Generic Medium posts
-            "linkedin.com", "facebook.com", "twitter.com"
+        # Penalize ONLY the most unreliable domains (reduced penalty to avoid losing good results)
+        unreliable_domains = [
+            "alchetron.com",  # Known unreliable
+            "prabook.com",    # Known unreliable
         ]
-        if any(low_domain in domain for low_domain in low_quality_domains):
-            # Heavy penalty - reduce score significantly
-            result["signals"]["relevance_score"] = max(0, result["signals"].get("relevance_score", 0) - 25)
+        if any(unreliable in domain for unreliable in unreliable_domains):
+            # Moderate penalty - don't completely eliminate these results
+            result["signals"]["relevance_score"] = max(0, result["signals"].get("relevance_score", 0) - 10)
         
         # Boost reliable sources moderately
         reliable_sources = [
@@ -1206,7 +1216,7 @@ async def _enhanced_search_impl(
             "semanticscholar.org", "scholar.google.com"
         ]
         if any(reliable in domain for reliable in reliable_sources):
-            result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 5
+            result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 8
 
     ordered = sorted(
         combined.values(),
