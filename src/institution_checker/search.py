@@ -126,15 +126,51 @@ YEAR_WINDOW = range(_CURRENT_YEAR - 12, _CURRENT_YEAR + 1)
 RECENT_YEAR_STRINGS = {str(_CURRENT_YEAR - offset) for offset in range(0, 3)}
 
 BING_URL = "https://www.bing.com/search"
+EXCERPT_FETCH_LIMIT = 4
+EXCERPT_HTTP_TIMEOUT = 8.0  # seconds
+EXCERPT_MAX_CHARS = 600
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
+_EXCERPT_SKIP_EXTENSIONS = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".wmv",
+    ".avi",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+)
+_EXCERPT_EVIDENCE_HINTS = [
+    "professor",
+    "faculty",
+    "graduate",
+    "phd",
+    "degree",
+    "alumni",
+    "staff",
+    "postdoc",
+    "director",
+    "dean",
+    "chair",
+    "works at",
+    "employed at",
+    "currently",
+]
 MAX_HTTP_ATTEMPTS = 3
 BROWSER_FETCH_ATTEMPTS = 2
-BROWSER_RESULT_SELECTORS = [
-    "li.b_algo",
-    "li.b_ans",
-    ".b_algo",
-    ".b_entityTP",
-    "[data-idx]",
-]
 CONSENT_SELECTORS = [
     "#bnp_btn_accept",
     "#bnp_btn_accept_all",
@@ -238,14 +274,19 @@ def _extract_name_components(person_name: str) -> Dict[str, List[str]]:
     normalized = _normalize_name_for_matching(person_name)
     tokens = [token for token in normalized.split() if token and len(token) > 0]
     
+    suffixes: List[str] = []
+    while tokens and tokens[-1] in _NAME_SUFFIXES:
+        suffixes.insert(0, tokens.pop())
+    
     if not tokens:
-        return {"first": [], "middle": [], "last": [], "initials": []}
+        return {"first": [], "middle": [], "last": [], "initials": [], "suffix": suffixes}
     
     components = {
         "first": [tokens[0]] if len(tokens) > 0 else [],
         "middle": tokens[1:-1] if len(tokens) > 2 else [],
         "last": [tokens[-1]] if len(tokens) > 1 else [],
-        "initials": []
+        "initials": [],
+        "suffix": suffixes,
     }
     
     # Add middle initials
@@ -296,6 +337,21 @@ def _institution_domain_guess(institution: str) -> Optional[str]:
     return f"{primary}.edu"
 
 
+def _is_institution_domain(url: str, institution: str, signals: Optional[Dict[str, object]] = None) -> bool:
+    if not url:
+        return False
+    domain = urlparse(url).netloc.lower()
+    if not domain:
+        return False
+    if domain.endswith(".edu"):
+        if not signals or signals.get("has_institution"):
+            return True
+    guess = _institution_domain_guess(institution)
+    if guess and guess in domain:
+        return True
+    return False
+
+
 def _ensure_name_and_institution(query: str, person_name: str, institution: str) -> str:
     parts: List[str] = []
     lowered = query.lower()
@@ -315,7 +371,7 @@ def _ensure_name_and_institution(query: str, person_name: str, institution: str)
 def _name_matches(text: str, person_name: str) -> bool:
     """Enhanced name matching with support for:
     - Middle name variations (John S. Smith vs John Samuel Smith)
-    - Diacritics (Córdova vs Cordova)
+    - Diacritics (Cordova with or without accent marks)
     - Different name orderings
     - Initials
     """
@@ -333,46 +389,111 @@ def _name_matches(text: str, person_name: str) -> bool:
     middle_names = components["middle"]
     last_names = components["last"]
     middle_initials = components["initials"]
+    suffixes = components.get("suffix", [])
     
     if not first_names or not last_names:
         # If we only have one name part, do simple matching
         return normalized_name in normalized_text
     
-    first = first_names[0]
-    last = last_names[0]
+    def _token_in_text(token: str) -> bool:
+        if not token:
+            return False
+        return bool(re.search(rf"\b{re.escape(token)}\b", normalized_text))
     
-    # Check for first and last name presence
-    if first not in normalized_text or last not in normalized_text:
+    candidate_firsts: List[str] = []
+    candidate_firsts.extend(first_names)
+    if first_names and len(first_names[0]) == 1 and middle_names:
+        candidate_firsts.append(middle_names[0])
+    if not candidate_firsts and middle_names:
+        candidate_firsts.append(middle_names[0])
+    candidate_firsts = [token for token in dict.fromkeys(candidate_firsts) if token]
+    
+    candidate_lasts: List[str] = [token for token in dict.fromkeys(last_names) if token]
+    if not candidate_lasts and suffixes:
+        candidate_lasts = [token for token in dict.fromkeys(suffixes) if token]
+    
+    if not candidate_lasts:
+        return normalized_name in normalized_text
+    
+    if not any(_token_in_text(last_token) for last_token in candidate_lasts):
+        return False
+    if candidate_firsts and not any(_token_in_text(first_token) for first_token in candidate_firsts):
         return False
     
-    # At this point, we have both first and last name
-    # Now check for middle name/initial variations
+    # At this point, we have first/last presence.
+    # Now check for common contiguous patterns to confirm high-confidence match.
     
-    # Pattern 1: First Middle Last
-    for middle in middle_names:
-        full_pattern = f"{first} {middle} {last}"
-        if full_pattern in normalized_text:
-            return True
+    for first_token in candidate_firsts or [""]:
+        for last_token in candidate_lasts or [""]:
+            if not first_token or not last_token:
+                continue
+            
+            # Pattern 1: First Middle Last
+            for middle in middle_names:
+                if not middle:
+                    continue
+                pattern = re.compile(
+                    rf'\b{re.escape(first_token)}\s+{re.escape(middle)}\s+{re.escape(last_token)}\b'
+                )
+                if pattern.search(normalized_text):
+                    return True
+            
+            # Pattern 2: First M. Last (middle initial with period)
+            for initial in middle_initials:
+                if not initial:
+                    continue
+                pattern = re.compile(
+                    rf'\b{re.escape(first_token)}\s+{re.escape(initial)}\.?\s+{re.escape(last_token)}\b'
+                )
+                if pattern.search(normalized_text):
+                    return True
+            
+            # Pattern 3: First Last (no middle)
+            pattern = re.compile(rf'\b{re.escape(first_token)}\s+{re.escape(last_token)}\b')
+            if pattern.search(normalized_text):
+                return True
+            
+            # Pattern 4: Last, First (reversed with optional comma)
+            pattern = re.compile(rf'\b{re.escape(last_token)}\s*,?\s+{re.escape(first_token)}\b')
+            if pattern.search(normalized_text):
+                return True
     
-    # Pattern 2: First M. Last (middle initial with period)
-    for initial in middle_initials:
-        initial_pattern = f"{first} {initial} {last}"
-        # Use regex to match optional period after initial
-        pattern = re.compile(rf'\b{re.escape(first)}\s+{re.escape(initial)}\.?\s+{re.escape(last)}\b')
-        if pattern.search(normalized_text):
-            return True
-    
-    # Pattern 3: First Last (no middle)
-    # Be more strict here - require word boundaries
-    pattern = re.compile(rf'\b{re.escape(first)}\s+{re.escape(last)}\b')
-    if pattern.search(normalized_text):
+    # Fallback: first/last tokens both present somewhere in the text
+    return True
+
+
+def _name_matches_url(url: str, person_name: str) -> bool:
+    """Detect whether the person's name is encoded in the URL path/netloc.
+
+    Helps rescue high-value pages where search snippets omit the name but the
+    page slug clearly targets the person (e.g., /people/john-doe).
+    """
+    if not url or not person_name:
+        return False
+
+    try:
+        parsed = urlsplit(url)
+        candidate = f"{parsed.netloc} {parsed.path}"
+    except ValueError:
+        candidate = url
+
+    normalized_candidate = _normalize_name_for_matching(candidate)
+    normalized_name = _normalize_name_for_matching(person_name)
+    if normalized_name and normalized_name in normalized_candidate:
         return True
-    
-    # Pattern 4: Last, First (reversed with comma)
-    reversed_pattern = f"{last} {first}"  # Sometimes comma is stripped
-    if reversed_pattern in normalized_text:
+
+    components = _extract_name_components(person_name)
+    first = components["first"][0] if components["first"] else ""
+    last = components["last"][0] if components["last"] else ""
+
+    # Require both tokens when possible to avoid noise from common surnames
+    if first and last and first in normalized_candidate and last in normalized_candidate:
         return True
-    
+
+    # Fallback: accept distinctive last-name-only matches for .edu slugs, etc.
+    if last and len(last) >= 4 and last in normalized_candidate:
+        return True
+
     return False
 
 def _normalise_url(raw_url: str) -> str:
@@ -513,6 +634,44 @@ def _compute_signals(
     }
 
 
+def _ensure_person_signal(
+    signals: Dict[str, object],
+    url: str,
+    institution: str,
+    person_name: str,
+) -> Dict[str, object]:
+    """Confirm a result is person-specific, boosting signals when URL/domain imply it.
+    
+    We prefer to keep potentially relevant results so the LLM can decide. Instead of dropping
+    uncertain matches, we keep them with a soft penalty while annotating confidence.
+    """
+    if not person_name:
+        return signals
+    if signals.get("has_person_name"):
+        return signals
+
+    updated = dict(signals)
+    base_score = updated.get("relevance_score", 0)
+
+    if _name_matches_url(url, person_name):
+        updated["has_person_name"] = True
+        updated["relevance_score"] = base_score + 3
+        updated["person_match_confidence"] = "url"
+        return updated
+
+    if _is_institution_domain(url, institution, signals):
+        updated["has_person_name"] = True
+        updated["relevance_score"] = base_score + 2
+        updated["person_match_confidence"] = "institution_domain"
+        return updated
+
+    # Soft keep: retain the result but note the uncertainty so downstream consumers can adjust.
+    updated["person_match_confidence"] = "soft"
+    if base_score <= 0:
+        updated["relevance_score"] = 1
+    return updated
+
+
 async def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     async with _http_lock:
@@ -570,9 +729,137 @@ async def _fetch_with_httpx(query: str, count: int, debug: bool = False) -> str:
                 print(f"[search] Waiting {delay:.1f}s before retry...")
             await asyncio.sleep(delay)
     
-    if debug:
-        print(f"[search] HTTP fetch failed after {MAX_HTTP_ATTEMPTS} attempts")
+        if debug:
+            print(f"[search] HTTP fetch failed after {MAX_HTTP_ATTEMPTS} attempts")
     return ""
+
+
+def _should_fetch_page_excerpt(result: Dict[str, object]) -> bool:
+    """Determine if a result needs extra on-page evidence fetched."""
+    url = _normalise_whitespace(str(result.get("url") or ""))
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    lowered = url.lower()
+    if any(lowered.endswith(ext) for ext in _EXCERPT_SKIP_EXTENSIONS):
+        return False
+
+    if result.get("page_excerpt"):
+        return False
+
+    signals = result.get("signals") or {}
+    score = signals.get("relevance_score", 0)
+    has_person = bool(signals.get("has_person_name"))
+    has_institution = bool(signals.get("has_institution"))
+    match_confidence = signals.get("person_match_confidence")
+
+    # Bail out only for extremely weak/irrelevant results
+    if score <= 0 and not has_person and not has_institution:
+        return False
+
+    # Prefer to enrich soft matches or results missing clear evidence
+    if match_confidence == "soft":
+        return True
+
+    snippet = _normalise_whitespace(str(result.get("snippet") or ""))
+    if not snippet or len(snippet) < 80:
+        return True
+
+    snippet_lower = snippet.lower()
+    evidence_terms_present = any(term in snippet_lower for term in _EXCERPT_EVIDENCE_HINTS)
+    if not evidence_terms_present:
+        return True
+
+    # If both person and institution already identified and snippet contains explicit evidence, skip fetch
+    if has_person and has_institution:
+        return False
+
+    return True
+
+
+async def _get_page_excerpt(url: str, person_name: str) -> Optional[str]:
+    """Fetch a short excerpt from the page, favouring sentences that mention the person."""
+    if not url:
+        return None
+
+    client = await _get_http_client()
+    try:
+        response = await client.get(
+            url,
+            headers={"User-Agent": random.choice(USER_AGENTS)},
+            timeout=EXCERPT_HTTP_TIMEOUT,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    binary_markers = ["pdf", "image", "audio", "video", "zip", "octet", "msword", "excel", "powerpoint"]
+    if any(marker in content_type for marker in binary_markers):
+        return None
+
+    html = response.text
+    if not html or len(html) < 120:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+        tag.decompose()
+
+    text = _normalise_whitespace(soup.get_text(" ", strip=True))
+    if not text or len(text) < 60:
+        return None
+
+    normalized_target = _normalize_name_for_matching(person_name) if person_name else ""
+    if normalized_target:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        for sentence in sentences:
+            if normalized_target in _normalize_name_for_matching(sentence):
+                excerpt = sentence.strip()
+                if len(excerpt) > EXCERPT_MAX_CHARS:
+                    excerpt = excerpt[:EXCERPT_MAX_CHARS].rstrip() + "..."
+                return excerpt
+
+    excerpt = text[:EXCERPT_MAX_CHARS].strip()
+    if len(text) > EXCERPT_MAX_CHARS:
+        excerpt += "..."
+    return excerpt
+
+
+async def _attach_page_excerpt(result: Dict[str, object], person_name: str) -> None:
+    try:
+        excerpt = await _get_page_excerpt(str(result.get("url") or ""), person_name)
+    except Exception:
+        return
+    if excerpt:
+        result["page_excerpt"] = excerpt
+
+
+async def _enrich_with_page_excerpts(
+    results: Iterable[Dict[str, object]],
+    person_name: str,
+    limit: int = EXCERPT_FETCH_LIMIT,
+) -> None:
+    if not results or not person_name or limit <= 0:
+        return
+
+    selected: List[Dict[str, object]] = []
+    seen_urls = set()
+    for item in results:
+        if len(selected) >= limit:
+            break
+        url = str(item.get("url") or "")
+        if not url or url in seen_urls:
+            continue
+        if _should_fetch_page_excerpt(item):
+            selected.append(item)
+            seen_urls.add(url)
+
+    if not selected:
+        return
+
+    tasks = [asyncio.create_task(_attach_page_excerpt(item, person_name)) for item in selected]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _get_browser():
@@ -711,7 +998,7 @@ async def _fetch_with_browser(query: str, count: int, debug: bool = False) -> st
                 await asyncio.sleep(0.25)
                 await _dismiss_bing_consent(page, debug=debug)
                 result_ready = False
-                for selector in BROWSER_RESULT_SELECTORS:
+                for selector in SELECTORS:
                     try:
                         await page.waitForSelector(selector, {"timeout": 6000})
                         result_ready = True
@@ -743,6 +1030,52 @@ async def _fetch_with_browser(query: str, count: int, debug: bool = False) -> st
     return result_html
 
 
+def _build_extended_snippet(element) -> str:
+    """Extract a richer snippet from the search result element without visiting the page."""
+    seen_lower = set()
+    parts: List[str] = []
+
+    def _add_text(raw: str) -> None:
+        text = _normalise_whitespace(raw)
+        if not text:
+            return
+        lowered = text.lower()
+        if lowered in seen_lower:
+            return
+        seen_lower.add(lowered)
+        parts.append(text)
+
+    candidate_selectors = [
+        ".b_caption p",
+        ".b_snippet",
+        ".b_secondaryText",
+        ".b_factrow",
+        ".b_paractl",
+        ".b_lineclamp",
+        ".b_text",
+    ]
+    for selector in candidate_selectors:
+        for node in element.select(selector):
+            _add_text(node.get_text(" ", strip=True))
+
+    # Capture bullet lists or fact rows for additional context.
+    for node in element.select(".b_factrow li, ul li"):
+        _add_text(node.get_text(" ", strip=True))
+
+    if not parts:
+        for node in element.find_all("p", limit=2):
+            _add_text(node.get_text(" ", strip=True))
+
+    if not parts:
+        fallback_text = element.get_text(" ", strip=True)
+        _add_text(fallback_text)
+
+    combined = " ".join(parts)
+    if len(combined) > 800:
+        combined = combined[:797].rstrip() + "..."
+    return combined
+
+
 def _parse_result_element(
     element,
     institution: str,
@@ -762,17 +1095,9 @@ def _parse_result_element(
     title = _normalise_whitespace(anchor.get_text(" ", strip=True))
     if not title:
         return None
-    snippet_node = (
-        element.select_one(".b_caption p")
-        or element.select_one(".b_snippet")
-        or element.select_one("p")
-    )
-    snippet = _normalise_whitespace(snippet_node.get_text(" ", strip=True) if snippet_node else "")
-    if len(snippet) > 500:
-        snippet = snippet[:497] + "..."
+    snippet = _build_extended_snippet(element)
     signals = _compute_signals(title, snippet, url, institution, person_name)
-    if person_name and not signals["has_person_name"]:
-        return None
+    signals = _ensure_person_signal(signals, url, institution, person_name)
     return {
         "title": title,
         "url": url,
@@ -802,6 +1127,7 @@ def _extract_results(
             candidates.append(element)
     results: List[Dict[str, object]] = []
     seen_urls = set()
+    rank_counter = 0
     for element in candidates:
         parsed = _parse_result_element(element, institution, person_name)
         if not parsed:
@@ -809,7 +1135,13 @@ def _extract_results(
         url = parsed["url"]
         if url in seen_urls:
             continue
+        rank_counter += 1
         seen_urls.add(url)
+        signals = parsed.get("signals", {})
+        if "source_rank" not in signals:
+            signals["source_rank"] = rank_counter
+        parsed["signals"] = signals
+        parsed["rank"] = rank_counter
         results.append(parsed)
         if len(results) >= limit:
             break
@@ -825,18 +1157,20 @@ def _extract_results(
             
             if url in seen_urls:
                 continue
+            rank_counter += 1
             title = _normalise_whitespace(anchor.get_text(" ", strip=True))
             if len(title) < 8:
                 continue
             snippet = ""
             signals = _compute_signals(title, snippet, url, institution, person_name)
-            if person_name and not signals["has_person_name"]:
-                continue
+            signals = _ensure_person_signal(signals, url, institution, person_name)
+            signals.setdefault("source_rank", rank_counter)
             results.append({
                 "title": title,
                 "url": url,
                 "snippet": snippet,
                 "signals": signals,
+                "rank": rank_counter,
             })
             seen_urls.add(url)
             if len(results) >= limit:
@@ -868,8 +1202,10 @@ async def bing_search(
         person_name=person_name,
         debug=debug,
     )
-    results.sort(key=lambda item: item["signals"]["relevance_score"], reverse=True)
-    return results[:num_results]
+    results.sort(key=lambda item: item.get("rank") or item["signals"].get("source_rank", float("inf")))
+    top_results = results[:num_results]
+    await _enrich_with_page_excerpts(top_results, person_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
+    return top_results
 
 
 def _build_strategies(
@@ -890,12 +1226,30 @@ def _build_strategies(
     base_limit = max(4, min(6, per_strategy_limit))
 
     strategies: List[QueryStrategy] = [
-        # Most important: core profile search
+        # HIGHEST PRIORITY: Name + Institution combined (ensures both appear together)
+        QueryStrategy(
+            name="name_institution_combined",
+            query=f"{name_clause} {institution_clause}",  # Both terms together
+            limit=base_limit + 3,  # Highest limit
+            boost=6,  # Highest boost - these are most relevant
+        ),
+        # Connection-focused search (looking for explicit relationships)
+        QueryStrategy(
+            name="explicit_connection",
+            query=_compose_query(
+                name_clause,
+                institution_fragment,
+                '("professor at" OR "faculty" OR "graduated from" OR "degree from" OR "alumnus" OR "worked at")',
+            ),
+            limit=base_limit + 2,
+            boost=5,
+        ),
+        # Core profile search (general biographical info)
         QueryStrategy(
             name="core_profile",
             query=_compose_query(name_clause, institution_fragment),
-            limit=base_limit + 2,  # Higher for most important
-            boost=5,
+            limit=base_limit + 1,
+            boost=4,
         ),
         # Current status (high value for current vs past determination)
         QueryStrategy(
@@ -906,7 +1260,7 @@ def _build_strategies(
                 '("currently" OR "now" OR "presently")',
             ),
             limit=base_limit,
-            boost=4,
+            boost=3,
         ),
         # Career history (CV/bio pages are very informative)
         QueryStrategy(
@@ -945,10 +1299,13 @@ def _build_strategies(
                     site_filter,
                     '("faculty" OR "staff" OR "directory")',
                 ),
-                limit=base_limit + 1,  # Higher for official pages
-                boost=4,  # Higher boost for official domain
+                limit=base_limit + 2,  # Higher for official pages
+                boost=5,  # Very high boost for official domain
             )
         )
+
+    for index, strategy in enumerate(strategies):
+        setattr(strategy, "order", index)
 
     return strategies
 
@@ -959,7 +1316,12 @@ def _annotate_signals(
     effective_query: str,
 ) -> Dict[str, object]:
     signals = dict(result["signals"])
+    if "source_rank" not in signals and isinstance(result.get("rank"), int):
+        signals["source_rank"] = result["rank"]
     signals["strategy"] = strategy.name
+    strategy_order = getattr(strategy, "order", None)
+    if strategy_order is not None:
+        signals["strategy_order"] = strategy_order
     signals["strategy_boost"] = strategy.boost
     signals["queries"] = [effective_query]
     signals["strategies"] = [strategy.name]
@@ -969,6 +1331,7 @@ def _annotate_signals(
         "url": result.get("url", ""),
         "snippet": result.get("snippet", ""),
         "signals": signals,
+        "rank": result.get("rank"),
     }
 
 
@@ -1011,6 +1374,31 @@ def _merge_results(existing: Dict[str, object], candidate: Dict[str, object]) ->
     candidate_boost = candidate_signals.get("strategy_boost", 0)
     merged_signals["strategy_boost"] = max(existing_boost, candidate_boost)
     merged_signals["strategy_hits"] = len(merged_signals["strategies"])
+
+    existing_rank_value = merged_signals.get("source_rank")
+    candidate_rank_value = candidate_signals.get("source_rank")
+    if candidate_rank_value is not None:
+        if existing_rank_value is None or candidate_rank_value < existing_rank_value:
+            merged_signals["source_rank"] = candidate_rank_value
+
+    existing_rank_attr = merged.get("rank")
+    candidate_rank_attr = candidate.get("rank")
+    if isinstance(candidate_rank_attr, int):
+        if not isinstance(existing_rank_attr, int) or candidate_rank_attr < existing_rank_attr:
+            merged["rank"] = candidate_rank_attr
+
+    existing_order = merged_signals.get("strategy_order")
+    candidate_order = candidate_signals.get("strategy_order")
+    if candidate_order is not None:
+        if existing_order is None or candidate_order < existing_order:
+            merged_signals["strategy_order"] = candidate_order
+
+    # Preserve highest-confidence person match annotation
+    candidate_confidence = candidate_signals.get("person_match_confidence")
+    if candidate_confidence:
+        existing_confidence = merged_signals.get("person_match_confidence")
+        if not existing_confidence or existing_confidence == "soft":
+            merged_signals["person_match_confidence"] = candidate_confidence
 
     if len(candidate.get("snippet", "")) > len(merged.get("snippet", "")):
         merged["snippet"] = candidate.get("snippet", "")
@@ -1221,11 +1609,11 @@ async def _enhanced_search_impl(
     ordered = sorted(
         combined.values(),
         key=lambda item: (
-            item["signals"].get("relevance_score", 0),
-            item["signals"].get("strategy_hits", 1),
-            len(item.get("snippet", "")),
+            item["signals"].get("source_rank", float("inf")),
+            -item["signals"].get("relevance_score", 0),
+            -item["signals"].get("strategy_hits", 0),
+            -len(item.get("snippet", "")),
         ),
-        reverse=True,
     )
 
     # SAFETY: If we don't have enough results (e.g., all strategies timed out or failed),
@@ -1242,7 +1630,11 @@ async def _enhanced_search_impl(
             debug=debug,
         )
 
-    return ordered[:num_results]
+    top_results = ordered[:num_results]
+    for idx, result in enumerate(top_results, start=1):
+        result["rank"] = idx
+    await _enrich_with_page_excerpts(top_results, clean_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
+    return top_results
 
 
 ENHANCED_SEARCH_TIMEOUT = 45.0  # Maximum time for enhanced search to complete

@@ -5,64 +5,43 @@ import json
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
+import unicodedata
 
 from .config import get_api_key, LLM_API_URL, MODEL_NAME
 
 _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 _last_refresh_time = 0.0
+_PROMPT_LOGGING_ENABLED = False
 
-MAX_RESULTS_FOR_PROMPT = 20  # Use all search results to maximize evidence coverage
+MAX_RESULTS_FOR_PROMPT = 12  # Reduced from 18 for faster, more consistent responses
 
 # STRICT EVIDENCE-BASED PROMPT - Balanced for speed and accuracy
-PROMPT_TEMPLATE = """Verify if {name} has official connection to {institution}. 
-READ ALL {max_results} RESULTS BELOW - evidence may be in any result.
+PROMPT_TEMPLATE = """You are an evidence-driven verifier confirming whether {name} has a past or present relationship with {institution}. Read all {max_results} search findings below and decide if there is a real connection.
 
-Search results:
-{search_findings}
+Confirm a connection only when the evidence explicitly states an earned degree or a formal institutional role (faculty, staff, executive, director, postdoc, visiting). Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the line that proves the connection.
 
-REQUIRED EVIDENCE (need ≥1 for "Y"):
-1. Official .edu page: faculty/dept directory, alumni registry, official bio
-2. Explicit degree: "earned PhD from", "graduated from", "received BS from" 
-3. Explicit title: "Professor at", "President of", "Dean of", "worked at"
-4. Official CV/bio clearly stating role and institution
+Mark the relationship as "not_connected" when the evidence is limited to honorary awards, invited talks, external boards, publications, joint campuses (unless policy allows), or vague associations. Alumni requires an earned degree. "Attended" means studied without a confirmed degree. Use "current" when the language is present tense or references this year/{prior_year}; otherwise choose "past". Pick "unknown" when the timeframe cannot be inferred.
 
-VALID EXAMPLES → Mark "Y":
-• "earned his PhD from Stanford" → Alumni, past
-• "is a Professor of Biology at MIT" → Faculty, current  
-• "President of Harvard 2010-2015" → Executive, past
-• "graduated with BS from Purdue" → Alumni, past
+Return JSON only (no markdown) using this schema:
+{{
+    "verdict": "connected|not_connected|uncertain",
+    "relationship_type": "Alumni|Attended|Executive|Faculty|Postdoc|Staff|Visiting|Other|None",
+    "relationship_timeframe": "current|past|unknown",
+    "verification_detail": "Quote the decisive sentence or state why the connection fails",
+    "summary": "One concise sentence describing the relationship decision",
+    "primary_source": "Best supporting URL (prefer .edu)",
+    "confidence": "high|medium|low",
+    "verification_status": "verified|needs_review",
+    "temporal_context": "Dates/years mentioned or 'unknown'"
+}}
 
-AUTO-REJECT → Mark "N":
-❌ Events: keynote, Axelrod Lecturer, symposium, distinguished lecture, gave talk, invited speaker
-❌ Press/prizes: "press prize winner", "press award", journal editor (without employment)
-❌ External boards: "Board of [X] at [institution]" where X is external partner org
-❌ Weak inference: "research group from", "associated with", "connected to" (without explicit role)
-❌ Joint campus: IUPUI, IUPFW (unless policy allows)
-❌ Honorary degrees alone (without earned degree or employment)
-
-CONNECTION TYPES:
-Alumni (earned degree), Attended (studied, no confirmed degree), Executive (President/Provost/Dean/Director),
-Faculty (Professor/Instructor), Postdoc, Staff (employee/researcher), Visiting (formal appointment),
-Other (verified connection), Others (only if connected="N")
-
-TEMPORAL: Current = "is"/"serves"/present tense/{current_year}-{prior_year} | Past = "was"/"former"/end date/Alumni
-CONFIDENCE: High = .edu + explicit | Medium = reliable source + explicit | Low = weak/N
-
-JSON only (no markdown):
-{{{{
-  "connected": "Y" or "N",
-  "connection_type": "Alumni|Attended|Executive|Faculty|Postdoc|Staff|Visiting|Other|Others",
-  "connection_detail": "Quote explicit evidence",
-  "current_or_past": "current|past|N/A",
-  "supporting_url": "Best URL (prefer .edu)",
-  "confidence": "high|medium|low",
-  "temporal_evidence": "Dates/years or 'unknown'"
-}}}}"""
+Search findings:
+{search_findings}"""
 
 DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=15, sock_read=150)
 JSON_BLOCK_RE = re.compile(r"```(?:json)?(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -108,13 +87,74 @@ PAST_TERMS = [
 # Add year pattern for temporal detection
 YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
 # Pattern for date ranges like "2010-2015" or "2010 - 2015"
-DATE_RANGE_PATTERN = re.compile(r'\b(\d{4})\s*[-–—]\s*(\d{4})\b')
+DATE_RANGE_PATTERN = re.compile(r'\b(\d{4})\s*[---]\s*(\d{4})\b')
 # Pattern for "from X to Y"
 FROM_TO_PATTERN = re.compile(r'\bfrom\s+(\d{4})\s+to\s+(\d{4})\b', re.IGNORECASE)
 # Pattern for "since X" or "starting X"
 SINCE_PATTERN = re.compile(r'\b(?:since|starting|began\s+in|started\s+in)\s+(\d{4})\b', re.IGNORECASE)
 # Pattern for "until X" or "through X"
 UNTIL_PATTERN = re.compile(r'\b(?:until|through|ended\s+in|retired\s+in|left\s+in)\s+(\d{4})\b', re.IGNORECASE)
+
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
+_EVIDENCE_WINDOW_CHARS = 220
+_DEGREE_VERBS = [
+    "graduated",
+    "graduate",
+    "earned",
+    "received",
+    "obtained",
+    "completed",
+    "holds",
+    "was awarded",
+]
+_DEGREE_NOUNS = [
+    "degree",
+    "b.s.",
+    "b.s",
+    "bs",
+    "bsc",
+    "b.a.",
+    "ba",
+    "mba",
+    "m.s.",
+    "ms",
+    "msc",
+    "m.a.",
+    "ma",
+    "ph.d",
+    "phd",
+    "doctorate",
+    "jd",
+    "law degree",
+    "engineering degree",
+    "bachelors",
+    "bachelor",
+    "masters",
+    "master",
+]
+_DEGREE_PHRASES = ["degree from", "degree at"]
+_ALUMNI_TERMS = {
+    "alumnus",
+    "alumna",
+    "alumni",
+    "alum",
+    "alumnae",
+    "graduate",
+    "graduated",
+    "school of",
+    "college of",
+}
+_ATTENDED_TERMS = {
+    "attended",
+    "studied at",
+    "studied in",
+    "student at",
+    "enrolled at",
+    "enrolled in",
+    "matriculated at",
+    "went to",
+}
+_HONORARY_TERMS = ["honorary", "honoris causa"]
 
 
 async def get_session() -> aiohttp.ClientSession:
@@ -134,6 +174,22 @@ async def get_session() -> aiohttp.ClientSession:
         if _session is None or _session.closed:
             _session = aiohttp.ClientSession(timeout=DEFAULT_CLIENT_TIMEOUT)
         return _session
+
+
+def set_prompt_logging(enabled: bool) -> None:
+    """Globally enable or disable printing of LLM prompts."""
+    global _PROMPT_LOGGING_ENABLED
+    _PROMPT_LOGGING_ENABLED = bool(enabled)
+
+
+def enable_prompt_logging() -> None:
+    """Convenience helper to enable prompt logging."""
+    set_prompt_logging(True)
+
+
+def disable_prompt_logging() -> None:
+    """Convenience helper to disable prompt logging."""
+    set_prompt_logging(False)
 
 
 async def refresh_session() -> None:
@@ -174,64 +230,264 @@ def _safe_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _normalize_connected(value: Any) -> str:
-    text = _safe_text(value).upper()
-    if text in {"Y", "YES"}:
+def _strip_accents(text: str) -> str:
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def _normalize_simple(text: str) -> str:
+    return re.sub(r"\s+", " ", _strip_accents(_safe_text(text)).lower()).strip()
+
+
+def _tokenize_name(name: str) -> List[str]:
+    base = _normalize_simple(name)
+    if not base:
+        return []
+    tokens = [token for token in re.split(r"[^a-z0-9]+", base) if token]
+    # Remove trailing generational suffixes
+    while tokens and tokens[-1] in _NAME_SUFFIXES:
+        tokens.pop()
+    return tokens
+
+
+def _institution_aliases(institution: str) -> List[str]:
+    trimmed = _normalize_simple(institution)
+    if not trimmed:
+        return []
+    aliases = {trimmed}
+    parts = [token for token in trimmed.split() if token]
+    aliases.update(parts)
+    if "university" in trimmed:
+        aliases.add(trimmed.replace("university", "").strip())
+    if "college" in trimmed:
+        aliases.add(trimmed.replace("college", "").strip())
+    aliases.discard("")
+    return sorted(alias for alias in aliases if alias)
+
+
+def _institution_domain_guess(institution: str) -> Optional[str]:
+    trimmed = _normalize_simple(institution)
+    if not trimmed:
+        return None
+    words = [token for token in re.split(r"\s+", trimmed) if token and token not in {"the", "of", "at"}]
+    if not words:
+        return None
+    primary = re.sub(r"[^a-z]", "", words[0])
+    if not primary:
+        return None
+    return f"{primary}.edu"
+
+
+def _result_combined_text(result: Dict[str, Any]) -> str:
+    blocks = [
+        _safe_text(result.get("page_excerpt")),
+        _safe_text(result.get("snippet")),
+        _safe_text(result.get("title")),
+    ]
+    return " ".join(block for block in blocks if block)
+
+
+def _result_mentions_person(result: Dict[str, Any], name_tokens: List[str]) -> bool:
+    if not name_tokens:
+        return False
+    signals = result.get("signals") or {}
+    if signals.get("has_person_name") or signals.get("has_person"):
+        return True
+    text = _normalize_simple(_result_combined_text(result))
+    if not text:
+        return False
+    last_token = name_tokens[-1]
+    url_text = _normalize_simple(_safe_text(result.get("url")))
+    if len(last_token) > 2 and last_token not in text:
+        if not (url_text and last_token in url_text):
+            return False
+    first_token = name_tokens[0]
+    middle_tokens = name_tokens[1:-1]
+    if len(first_token) > 2 and first_token not in text:
+        first_initial = first_token[0]
+        initial_with_last = re.compile(
+            rf"\b{re.escape(first_initial)}\.?\s+{re.escape(last_token)}\b"
+        )
+        has_initial_combo = bool(initial_with_last.search(text))
+        has_middle_token = any(len(token) > 2 and token in text for token in middle_tokens)
+        name_in_url = url_text and first_token in url_text
+        if not (has_initial_combo or has_middle_token or name_in_url):
+            return False
+    if len(first_token) == 1:
+        initial_pattern = re.compile(rf"\b{re.escape(first_token)}\.?\b")
+        has_initial = bool(initial_pattern.search(text))
+        has_middle_token = any(len(token) > 2 and token in text for token in middle_tokens)
+        if not has_initial and not has_middle_token:
+            return False
+    return True
+
+
+def _trim_evidence_text(text: str) -> str:
+    clean = _safe_text(text)
+    if len(clean) <= 220:
+        return clean
+    return clean[:217].rstrip() + "..."
+
+
+def _classify_evidence_window(window_lower: str) -> Optional[str]:
+    if not window_lower:
+        return None
+    if any(term in window_lower for term in _HONORARY_TERMS):
+        return None
+    if any(term in window_lower for term in _ATTENDED_TERMS):
+        return "Attended"
+    if any(term in window_lower for term in _ALUMNI_TERMS):
+        return "Alumni"
+    if any(verb in window_lower for verb in _DEGREE_VERBS) and any(
+        phrase in window_lower for phrase in (*_DEGREE_NOUNS, *_DEGREE_PHRASES)
+    ):
+        return "Alumni"
+    return None
+
+
+def _find_search_evidence(
+    name: str,
+    institution: str,
+    results: Iterable[Dict[str, Any]],
+) -> Optional[Tuple[str, str, str, str]]:
+    """Scan search results for strong alumni/attended evidence.
+
+    Returns tuple (connection_type, detail, url, confidence).
+    """
+    name_tokens = _tokenize_name(name)
+    if not name_tokens:
+        return None
+    aliases = _institution_aliases(institution)
+    if not aliases:
+        return None
+    alias_pattern = re.compile("|".join(re.escape(alias) for alias in aliases), re.IGNORECASE)
+
+    for result in results or []:
+        url = _safe_text(result.get("url"))
+        if not url:
+            continue
+        domain = urlparse(url).netloc.lower()
+        text_original = _result_combined_text(result)
+        if not text_original:
+            continue
+        text_lower = text_original.lower()
+        if not _result_mentions_person(result, name_tokens):
+            continue
+        for match in alias_pattern.finditer(text_lower):
+            start = max(0, match.start() - _EVIDENCE_WINDOW_CHARS)
+            end = min(len(text_lower), match.end() + _EVIDENCE_WINDOW_CHARS)
+            window_lower = text_lower[start:end]
+            evidence_type = _classify_evidence_window(window_lower)
+            if evidence_type:
+                window_original = text_original[start:end]
+                detail = _trim_evidence_text(window_original)
+                confidence = "high" if domain.endswith(".edu") else "medium"
+                return (evidence_type, detail, url, confidence)
+    return None
+
+
+def _has_institution_signal(results: Iterable[Dict[str, Any]], institution: str) -> bool:
+    aliases = _institution_aliases(institution)
+    guess = _institution_domain_guess(institution)
+    if not aliases and not guess:
+        return False
+    alias_pattern = re.compile("|".join(re.escape(alias) for alias in aliases), re.IGNORECASE) if aliases else None
+
+    for result in results or []:
+        signals = result.get("signals") or {}
+        if signals.get("has_institution"):
+            return True
+        url = _safe_text(result.get("url"))
+        domain = urlparse(url).netloc.lower() if url else ""
+        text_lower = _result_combined_text(result).lower()
+        if alias_pattern and alias_pattern.search(text_lower):
+            return True
+        if guess and guess in domain:
+            return True
+        if domain.endswith(".edu") and alias_pattern and alias_pattern.search(domain):
+            return True
+    return False
+
+
+def _normalize_verdict(value: Any) -> str:
+    text = _safe_text(value).lower()
+    if text in {"connected", "yes", "y"}:
+        return "connected"
+    if text in {"not_connected", "no", "n"}:
+        return "not_connected"
+    if text in {"uncertain", "uncertain_connection", "maybe"}:
+        return "uncertain"
+    return "uncertain"
+
+
+def _normalize_connected(verdict: str) -> str:
+    if verdict == "connected":
         return "Y"
-    if text in {"N", "NO"}:
+    if verdict == "not_connected":
         return "N"
     return "N"
 
 
-def _normalize_connection_type(value: Any, connected: str) -> str:
+def _normalize_connection_type(value: Any, verdict: str) -> str:
     """Normalize connection type to valid options."""
     text = _safe_text(value).strip()
-    # If not connected, must be "Others"
-    if connected != "Y":
-        return "Others"
-    
-    # Valid connection types (case-insensitive matching)
+    if verdict != "connected":
+        return "None"
+
     valid_types = {
         "alumni": "Alumni",
-        "attended": "Attended", 
+        "attended": "Attended",
         "executive": "Executive",
         "faculty": "Faculty",
         "postdoc": "Postdoc",
         "staff": "Staff",
         "visiting": "Visiting",
-        "other": "Other"}
-    
+        "other": "Other",
+        "others": "Other"
+    }
+
     text_lower = text.lower()
     if text_lower in valid_types:
         return valid_types[text_lower]
-    
-    # Try partial matching for common variations
+
     if "alum" in text_lower or "graduate" in text_lower:
         return "Alumni"
     if "student" in text_lower and "post" not in text_lower:
         return "Attended"
-    if "prof" in text_lower or "teach" in text_lower or "lecturer" in text_lower or "instructor" in text_lower:
+    if any(term in text_lower for term in ("prof", "teach", "lecturer", "instructor")):
         return "Faculty"
     if "postdoc" in text_lower or "post-doc" in text_lower:
         return "Postdoc"
-    if "president" in text_lower or "dean" in text_lower or "director" in text_lower or "admin" in text_lower or "chancellor" in text_lower:
+    if any(term in text_lower for term in ("president", "dean", "director", "admin", "chancellor", "provost")):
         return "Executive"
-    if "staff" in text_lower or "researcher" in text_lower or "scientist" in text_lower:
+    if any(term in text_lower for term in ("staff", "researcher", "scientist", "engineer")):
         return "Staff"
     if "visit" in text_lower:
         return "Visiting"
-    
-    # Default to "Other" for connected cases with unclear type
+
     return "Other"
 
 
-def _normalize_current_or_past(value: Any) -> str:
+def _normalize_timeframe(value: Any, verdict: str) -> str:
     text = _safe_text(value).lower()
     if text in {"current", "present"}:
         return "current"
     if text in {"past", "former", "previous"}:
         return "past"
-    return "N/A"
+    if text in {"na", "n/a", "unknown", "unsure"}:
+        return "unknown"
+    return "unknown" if verdict != "connected" else "unknown"
+
+
+def _normalize_verification_status(value: Any, verdict: str) -> str:
+    text = _safe_text(value).lower()
+    if text in {"verified", "complete", "confirmed"}:
+        return "verified"
+    if text in {"needs_review", "review", "manual"}:
+        return "needs_review"
+    return "needs_review" if verdict != "connected" else "verified"
 
 
 def _normalize_confidence(value: Any) -> str:
@@ -315,31 +571,91 @@ def _clean_json_blob(text: str) -> str:
 def _build_error(reason: str) -> Dict[str, str]:
     message = _safe_text(reason) or "Unknown error"
     return {
+        "verdict": "not_connected",
         "connected": "N",
+        "relationship_type": "None",
+        "relationship_timeframe": "unknown",
+        "verification_detail": f"Error: {message}",
+        "summary": f"Processing error: {message}",
+        "primary_source": "",
+        "confidence": "low",
+        "verification_status": "needs_review",
+        "temporal_context": f"Processing error: {message}",
         "connection_type": "Others",
         "connection_detail": f"Error: {message}",
         "current_or_past": "N/A",
         "supporting_url": "",
-        "confidence": "low",
         "temporal_evidence": f"Processing error: {message}",
     }
 
 
 def _normalize_decision(payload: Dict[str, Any]) -> Dict[str, str]:
-    connected = _normalize_connected(payload.get("connected"))
+    verdict_source = payload.get("verdict") or payload.get("connected")
+    verdict = _normalize_verdict(verdict_source)
+    connected = _normalize_connected(verdict)
+
+    relationship_type_source = payload.get("relationship_type") or payload.get("connection_type")
+    relationship_type = _normalize_connection_type(relationship_type_source, verdict)
+
+    timeframe_source = payload.get("relationship_timeframe") or payload.get("current_or_past")
+    relationship_timeframe = _normalize_timeframe(timeframe_source, verdict)
+
+    verification_detail = _safe_text(
+        payload.get("verification_detail") or payload.get("connection_detail")
+    )
+    summary_text = _safe_text(payload.get("summary"))
+    primary_source = _safe_text(
+        payload.get("primary_source") or payload.get("supporting_url")
+    )
+    confidence = _normalize_confidence(payload.get("confidence"))
+    verification_status = _normalize_verification_status(payload.get("verification_status"), verdict)
+    temporal_context = _safe_text(
+        payload.get("temporal_context") or payload.get("temporal_evidence")
+    )
+
+    if not summary_text:
+        if verification_detail:
+            summary_text = verification_detail[:220]
+        elif verdict == "connected":
+            summary_text = f"Confirmed {relationship_type.lower()} link to institution."
+        elif verdict == "not_connected":
+            summary_text = "No verified institutional relationship discovered."
+        else:
+            summary_text = "Insufficient evidence to confirm a relationship."
+
     normalized = {
+        "verdict": verdict,
         "connected": connected,
-        "connection_type": _normalize_connection_type(payload.get("connection_type"), connected),
-        "connection_detail": _safe_text(payload.get("connection_detail")),
-        "current_or_past": _normalize_current_or_past(payload.get("current_or_past")),
-        "supporting_url": _safe_text(payload.get("supporting_url")),
-        "confidence": _normalize_confidence(payload.get("confidence")),
-        "temporal_evidence": _safe_text(payload.get("temporal_evidence")),
+        "relationship_type": relationship_type,
+        "relationship_timeframe": relationship_timeframe,
+        "verification_detail": verification_detail,
+        "summary": summary_text,
+        "primary_source": primary_source,
+        "confidence": confidence,
+        "verification_status": verification_status,
+        "temporal_context": temporal_context or "unknown",
     }
-    if normalized["connected"] != "Y":
-        normalized["current_or_past"] = "N/A"
+
+    # Backward-compatible aliases for downstream consumers that still expect legacy keys
+    legacy_type = relationship_type if verdict == "connected" else "Others"
+    legacy_timeframe = (
+        relationship_timeframe
+        if verdict == "connected" and relationship_timeframe in {"current", "past"}
+        else "N/A"
+    )
+    normalized.update(
+        {
+            "connection_type": legacy_type,
+            "connection_detail": verification_detail or summary_text,
+            "current_or_past": legacy_timeframe,
+            "supporting_url": primary_source,
+            "temporal_evidence": temporal_context or "unknown",
+        }
+    )
+
+    if verdict != "connected":
         normalized["confidence"] = _normalize_confidence("low")
-        normalized["connection_type"] = "Others"
+
     return normalized
 
 
@@ -347,12 +663,9 @@ def _format_result_row(result: Dict[str, Any], index: int) -> str:
     """Format a search result for LLM consumption with clear structure."""
     title = _safe_text(result.get("title"))
     snippet = _safe_text(result.get("snippet"))
+    excerpt = _safe_text(result.get("page_excerpt"))
     url = _safe_text(result.get("url"))
     rank = result.get("rank")
-    signals = result.get("signals", {})
-    relevance = signals.get("relevance_score", 0)
-    has_current = signals.get("has_current", False)
-    has_past = signals.get("has_past", False)
     
     # Format with clear labels for better LLM parsing
     rank_prefix = f"#{rank} " if isinstance(rank, int) else ""
@@ -361,18 +674,13 @@ def _format_result_row(result: Dict[str, Any], index: int) -> str:
     if title:
         lines.append(f"Title: {rank_prefix}{title}")
     if snippet:
-        lines.append(f"Description: {snippet}")
+        trimmed_snippet = snippet if len(snippet) <= 220 else f"{snippet[:217].rstrip()}..."
+        lines.append(f"Snippet: {trimmed_snippet}")
+    if excerpt:
+        trimmed_excerpt = excerpt if len(excerpt) <= 300 else f"{excerpt[:297].rstrip()}..."
+        lines.append(f"Excerpt: {trimmed_excerpt}")
     if url:
         lines.append(f"URL: {url}")
-    
-    # Add temporal signals to help LLM identify current vs past
-    if relevance > 0 or has_current or has_past:
-        signal_info = f"Relevance: {relevance}"
-        if has_current:
-            signal_info += " [Contains CURRENT indicators]"
-        if has_past:
-            signal_info += " [Contains PAST indicators]"
-        lines.append(signal_info)
     
     # Use newlines for better readability by LLM
     payload = "\n   ".join(lines)
@@ -408,12 +716,21 @@ def _extract_fields_with_regex(text: str) -> Dict[str, Any]:
     
     # Pattern for each field - very flexible
     patterns = {
+        "verdict": r'"verdict"\s*:\s*"(connected|not_connected|uncertain)"',
+        "relationship_type": r'"relationship_type"\s*:\s*"(Alumni|Attended|Executive|Faculty|Postdoc|Staff|Visiting|Other|None)"',
+        "relationship_timeframe": r'"relationship_timeframe"\s*:\s*"(current|past|unknown)"',
+        "verification_detail": r'"verification_detail"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
+        "summary": r'"summary"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
+        "primary_source": r'"primary_source"\s*:\s*"([^"]*)"',
+        "confidence": r'"confidence"\s*:\s*"(high|medium|low)"',
+        "verification_status": r'"verification_status"\s*:\s*"(verified|needs_review)"',
+        "temporal_context": r'"temporal_context"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
+        # Legacy fields (for compatibility with older responses)
         "connected": r'"connected"\s*:\s*"([YN])"',
         "connection_type": r'"connection_type"\s*:\s*"(Alumni|Attended|Executive|Faculty|Postdoc|Staff|Other|Others)"',
         "connection_detail": r'"connection_detail"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
         "current_or_past": r'"current_or_past"\s*:\s*"(current|past|N/A)"',
         "supporting_url": r'"supporting_url"\s*:\s*"([^"]*)"',
-        "confidence": r'"confidence"\s*:\s*"(high|medium|low)"',
         "temporal_evidence": r'"temporal_evidence"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
     }
     
@@ -424,16 +741,31 @@ def _extract_fields_with_regex(text: str) -> Dict[str, Any]:
             # Unescape common patterns
             value = value.replace('\\"', '"').replace('\\n', ' ').replace('\\\\', '\\')
             result[field] = value
-    
-    # Set defaults for missing fields
-    result.setdefault("connected", "N")
-    result.setdefault("connection_type", "Others")
-    result.setdefault("connection_detail", "Unable to determine")
-    result.setdefault("current_or_past", "N/A")
-    result.setdefault("supporting_url", "")
-    result.setdefault("confidence", "low")
-    result.setdefault("temporal_evidence", "Insufficient information")
-    
+
+    if not result:
+        return {}
+
+    # Set defaults for any missing optional fields once we know at least one key matched
+    defaults = {
+        "verdict": "uncertain",
+        "relationship_type": "None",
+        "relationship_timeframe": "unknown",
+        "verification_detail": "Unable to determine",
+        "summary": "Insufficient information to confirm relationship",
+        "primary_source": "",
+        "confidence": "low",
+        "verification_status": "needs_review",
+        "temporal_context": "Insufficient information",
+        "connected": "N",
+        "connection_type": "Others",
+        "connection_detail": "Unable to determine",
+        "current_or_past": "N/A",
+        "supporting_url": "",
+        "temporal_evidence": "Insufficient information",
+    }
+    for field, default in defaults.items():
+        result.setdefault(field, default)
+
     return result
 
 
@@ -478,6 +810,24 @@ def _sanitize_json_string(text: str) -> str:
     return text
 
 
+def _ensure_json_object(text: str) -> str:
+    """Ensure the text looks like a JSON object by adding braces if missing."""
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+
+    has_open = stripped.startswith("{")
+    has_close = stripped.endswith("}")
+
+    if not has_open:
+        stripped = "{" + stripped
+    if not has_close:
+        stripped = stripped.rstrip(", \n\r\t")
+        stripped = stripped + "}"
+
+    return stripped
+
+
 def _parse_response(raw: str) -> Dict[str, Any]:
     """Parse LLM response with multiple fallback strategies."""
     # Strategy 1: Clean and extract JSON
@@ -485,17 +835,18 @@ def _parse_response(raw: str) -> Dict[str, Any]:
     
     # Strategy 2: Sanitize before parsing
     sanitized = _sanitize_json_string(candidate)
+    sanitized_wrapped = _ensure_json_object(sanitized)
     
     # Try parsing the sanitized version
     try:
-        return json.loads(sanitized)
+        return json.loads(sanitized_wrapped)
     except json.JSONDecodeError:
         pass
     
     # Strategy 3: Try the original candidate
     try:
-        return json.loads(candidate)
-    except json.JSONDecodeError as first_error:
+        return json.loads(_ensure_json_object(candidate))
+    except json.JSONDecodeError:
         pass
     
     # Strategy 4: Try common fixes
@@ -517,14 +868,14 @@ def _parse_response(raw: str) -> Dict[str, Any]:
         # Remove newlines and try again
         fixed = candidate.replace('\n', ' ').replace('\r', '')
         fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-        return json.loads(fixed)
+        return json.loads(_ensure_json_object(fixed))
     except json.JSONDecodeError:
         pass
     
     # Strategy 5: Use regex extraction as last resort
     try:
         extracted = _extract_fields_with_regex(raw)
-        if extracted.get("connected") in ["Y", "N"]:
+        if extracted:
             return extracted
     except Exception:
         pass
@@ -544,60 +895,124 @@ async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.2) 
         "Authorization": f"Bearer {get_api_key()}",
         "Content-Type": "application/json",
     }
-    payload = {
+    base_payload: Dict[str, Any] = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": "You are a JSON generator. Output ONLY valid JSON with no markdown or extra text. You are thorough and read all provided information before making decisions."},
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that outputs only valid JSON objects. Never include markdown, reasoning, or explanations.",
+            },
             {"role": "user", "content": prompt},
         ],
         "temperature": temperature,
-        "reasoning_effort": "medium",  # Changed from "low" to "medium" for better reasoning
-        # No max_tokens - thinking models need unlimited tokens for reasoning + output
+        "stream": False,
     }
+
+    attempt_payloads: List[Dict[str, Any]] = [
+        dict(base_payload),  # Try without response_format first
+        {**base_payload, "temperature": 0.3},  # Try slightly higher temperature
+        {**base_payload, "temperature": 0.1},  # Try lower temperature
+    ]
+    last_error_text: Optional[str] = None
     
-    async with session.post(LLM_API_URL, json=payload, headers=headers) as response:
-        text = await response.text()
-        
-        if debug:
-            print(f"[LLM] Response status: {response.status}")
-            print(f"[LLM] Response length: {len(text)} chars")
-        
-        if response.status >= 500:
-            raise RuntimeError(f"LLM server error {response.status}: {text[:200]}")
-        if response.status >= 400:
-            raise RuntimeError(f"LLM request failed ({response.status}): {text[:200]}")
-        
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            if debug:
-                print(f"[LLM] Failed to parse server response as JSON")
-            raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
-        
-        choices = data.get("choices") or []
-        if not choices:
-            if debug:
-                print(f"[LLM] No choices in response")
-            raise RuntimeError("LLM response contained no choices")
-        
-        content = choices[0].get("message", {}).get("content", "")
-        
-        if debug:
-            print(f"[LLM] Content length: {len(content)} chars")
-            if len(content) < 200:
-                print(f"[LLM] Full content: {content}")
-            else:
-                print(f"[LLM] Content preview: {content[:200]}...")
+    for idx, payload in enumerate(attempt_payloads):
+        if debug and idx > 0:
+            print(f"[LLM] Trying payload variant {idx + 1}/{len(attempt_payloads)}")
             
-            # Check for truncation
-            if not content.strip().endswith("}"):
-                print(f"[LLM] ⚠️  WARNING: Response doesn't end with }}, likely TRUNCATED")
-                print(f"[LLM] Last 100 chars: ...{content[-100:]}")
-        
-        if not content or not content.strip():
-            raise RuntimeError("LLM returned empty content")
-        
-        return _parse_response(content)
+        async with session.post(LLM_API_URL, json=payload, headers=headers) as response:
+            text = await response.text()
+            last_error_text = text
+
+            if debug:
+                print(f"[LLM] Response status: {response.status}")
+                print(f"[LLM] Response length: {len(text)} chars")
+
+            if response.status >= 500:
+                raise RuntimeError(f"LLM server error {response.status}: {text[:200]}")
+
+            if response.status >= 400:
+                if "response_format" in payload:
+                    # retry once more without response_format in case the endpoint does not support it
+                    continue
+                raise RuntimeError(f"LLM request failed ({response.status}): {text[:200]}")
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                if debug:
+                    print("[LLM] Failed to parse server response as JSON")
+                raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
+
+            # Debug: Print full API response structure
+            if debug:
+                print(f"[LLM DEBUG] Full API response keys: {list(data.keys())}")
+                print(f"[LLM DEBUG] Full API response: {json.dumps(data, indent=2)}")
+
+            choices = data.get("choices") or []
+            if not choices:
+                if debug:
+                    print("[LLM] No choices in response")
+                raise RuntimeError("LLM response contained no choices")
+
+            message = choices[0].get("message", {})
+            
+            # Debug: Print the entire message structure
+            if debug:
+                print(f"[LLM DEBUG] Message keys: {list(message.keys())}")
+                print(f"[LLM DEBUG] Full message structure: {json.dumps(message, indent=2)}")
+            
+            # For reasoning models, check if there's separate reasoning and content
+            reasoning = message.get("reasoning", "")
+            content = message.get("content", "")
+            
+            # If content looks like reasoning (doesn't start with {), try to extract JSON from it
+            content_stripped = content.strip()
+            if content_stripped and not content_stripped.startswith("{"):
+                if debug:
+                    print("[LLM DEBUG] Content doesn't start with {, appears to be reasoning text")
+                # Try to find JSON object within the reasoning text
+                json_match = re.search(r'\{[^{}]*"verdict"[^{}]*\}', content, re.DOTALL)
+                if json_match:
+                    extracted_json = json_match.group(0)
+                    if debug:
+                        print(f"[LLM DEBUG] Extracted JSON from reasoning: {extracted_json}")
+                    content = extracted_json
+                else:
+                    if debug:
+                        print("[LLM DEBUG] No JSON object found in reasoning text, will attempt to construct from reasoning")
+            
+            if debug:
+                if reasoning:
+                    print(f"[LLM] Reasoning length: {len(reasoning)} chars")
+                    print(f"[LLM] Reasoning preview: {reasoning[:300]}...")
+                print(f"[LLM] Content length: {len(content)} chars")
+                if len(content) < 500:
+                    print(f"[LLM] Full content: {content}")
+                else:
+                    print(f"[LLM] Content preview: {content[:300]}...")
+                if not content.strip().endswith("}"):
+                    print("[LLM] ??  WARNING: Response doesn't end with }, likely TRUNCATED")
+                    print(f"[LLM] Last 200 chars: ...{content[-200:]}")
+
+            if debug or _PROMPT_LOGGING_ENABLED:
+                separator = "=" * 48
+                if reasoning:
+                    print(f"{separator}\n[LLM REASONING]\n{separator}")
+                    print(reasoning)
+                    print(f"{separator}\n[END REASONING]\n{separator}")
+                print(f"{separator}\n[LLM RESPONSE (JSON)]\n{separator}")
+                print(content)
+                print(f"{separator}\n[END RESPONSE]\n{separator}")
+
+            if not content or not content.strip():
+                if debug:
+                    print(f"[LLM] Empty content received, trying next payload variant")
+                # Try next payload variant instead of failing immediately
+                continue
+
+            return _parse_response(content)
+
+    raise RuntimeError(f"LLM request failed after trying all payload variants. Last error: {last_error_text[:200] if last_error_text else 'empty content or unknown error'}")
 
 
 def _extract_domain(url: str) -> str:
@@ -628,21 +1043,6 @@ def _institution_tokens(institution: str) -> List[str]:
     tokens.discard("university")
     tokens.discard("college")
     return [token for token in tokens if token]
-
-
-def _institution_domain_guess(institution: str) -> Optional[str]:
-    trimmed = (institution or "").strip().lower()
-    if not trimmed:
-        return None
-    # Extract first meaningful word
-    words = [w for w in re.split(r'\s+', trimmed) if w and w not in {'the', 'of', 'at'}]
-    if not words:
-        return None
-    primary = re.sub(r"[^a-z]", "", words[0])
-    if not primary:
-        return None
-    return f"{primary}.edu"
-
 
 def _extract_years(text: str) -> List[int]:
     """Extract all year mentions from text."""
@@ -848,220 +1248,317 @@ def _postprocess_decision(
     results: List[Dict[str, Any]],
     decision: Dict[str, str],
 ) -> Dict[str, str]:
-    """Improve current/past classification and confidence using search result analysis.
-    
-    Now includes source quality assessment to adjust confidence.
-    Note: Only override LLM with VERY STRONG evidence to maintain consistency.
+    """Improve temporal classification and adjust confidence using targeted cues.
+
+    The logic here intentionally trusts the LLM output unless we find explicit,
+    contradictory evidence in the supporting material.
     """
     try:
-        # Force LOW confidence for all N decisions
-        if decision and decision.get("connected") == "N":
+        if not decision:
+            return decision
+
+        verdict = decision.get("verdict", "uncertain")
+
+        if verdict != "connected":
             if decision.get("confidence", "").lower() != "low":
                 decision = dict(decision)
                 decision["confidence"] = "low"
-        
-        if not decision or decision.get("connected") != "Y":
             return decision
 
-        tokens = _institution_tokens(institution)
-        target_domain = _institution_domain_guess(institution)
         current_year = datetime.utcnow().year
+        classification = decision.get("relationship_timeframe", "unknown")
+        supporting_url = decision.get("primary_source", "")
 
-        # Collect evidence from search results with enhanced date analysis
-        target_current_count = 0
-        target_past_count = 0
-        other_current_edu_urls: List[str] = []
-        target_urls_with_end_dates: List[str] = []
-        target_recent_years: List[int] = []
-        inferred_temporal_statuses: List[str] = []
+        # Locate the supporting search result (if available) for richer context
+        supporting_result: Optional[Dict[str, Any]] = None
+        if supporting_url:
+            for item in results or []:
+                if _safe_text(item.get("url")) == supporting_url:
+                    supporting_result = item
+                    break
 
-        for item in results or []:
-            title = _safe_text(item.get("title"))
-            snippet = _safe_text(item.get("snippet"))
-            url = _safe_text(item.get("url"))
-            domain = _extract_domain(url)
-            text = f"{title} {snippet}".lower()
-
-            # Check if this result is about the target institution
-            has_target = any(tok and tok in text for tok in tokens)
-            if target_domain:
-                domain_base = target_domain.replace('.edu', '')
-                has_target = has_target or domain_base in domain
-            
-            if has_target:
-                # Count temporal signals
-                current_signals = _count_temporal_signals(text, CURRENT_TERMS)
-                past_signals = _count_temporal_signals(text, PAST_TERMS)
-                
-                target_current_count += current_signals
-                target_past_count += past_signals
-                
-                # Use enhanced date extraction
-                inferred_status = _infer_temporal_status(text, current_year)
-                if inferred_status:
-                    inferred_temporal_statuses.append(inferred_status)
-                
-                # Check for date ranges indicating ended position
-                if _has_end_date(text, current_year):
-                    target_urls_with_end_dates.append(url)
-                
-                # Extract recent years
-                years = _extract_years(text)
-                target_recent_years.extend(y for y in years if y >= current_year - 2)
-            else:
-                # Check if person is currently at another institution
-                is_edu = domain.endswith(".edu")
-                if is_edu and _count_temporal_signals(text, CURRENT_TERMS) > 0:
-                    other_current_edu_urls.append(url)
-
-        # Decision logic: Use date-based inference + temporal signals
-        current_classification = decision.get("current_or_past", "current")
-        
-        # Count inferred statuses
-        inferred_current = inferred_temporal_statuses.count("current")
-        inferred_past = inferred_temporal_statuses.count("past")
-        
-        # Rule 1: If LLM says current, but we have VERY STRONG past evidence
-        if current_classification == "current":
-            # Strong past evidence: multiple date-based indicators
-            strong_past_evidence = (
-                len(target_urls_with_end_dates) >= 2 or  # Multiple ended positions
-                inferred_past >= 3 or  # Multiple results infer past
-                (inferred_past >= 2 and len(other_current_edu_urls) >= 2)  # Past + elsewhere
+        # Assemble the evidence text we want to reason over
+        evidence_parts: List[str] = [
+            _safe_text(decision.get("verification_detail")),
+            _safe_text(decision.get("temporal_context")),
+            _safe_text(decision.get("summary")),
+        ]
+        if supporting_result:
+            evidence_parts.extend(
+                [
+                    _safe_text(supporting_result.get("title")),
+                    _safe_text(supporting_result.get("snippet")),
+                    _safe_text(supporting_result.get("page_excerpt")),
+                ]
             )
-            
-            if strong_past_evidence:
+
+        evidence_text = " ".join(part for part in evidence_parts if part)
+        evidence_text_lower = evidence_text.lower()
+
+        # Extract any years mentioned across the evidence block
+        evidence_years: List[int] = []
+        for part in evidence_parts:
+            if part:
+                evidence_years.extend(_extract_years(part))
+        latest_year = max(evidence_years) if evidence_years else None
+
+        # Quick helpers for phrase detection (kept tight to avoid accidental matches)
+        def _has_phrase(text: str, phrases: Iterable[str]) -> bool:
+            return any(phrase in text for phrase in phrases)
+
+        strong_current_markers = [
+            " is currently ",
+            " currently serves ",
+            " currently is ",
+            " currently works ",
+            " currently teaches ",
+            " currently leads ",
+            " currently directs ",
+            " currently at ",
+            " currently holds ",
+            " serves as ",
+            " serving as ",
+            " now at ",
+            " now serves as ",
+            " now works as ",
+            " appointed as ",
+            " is an assistant ",
+            " is an associate ",
+            " is a professor ",
+            " is the professor ",
+            " is a dean ",
+            " is the dean ",
+            " is a director ",
+            " is the director ",
+            " is a president ",
+            " is the president ",
+            " is a chair ",
+            " is the chair ",
+        ]
+
+        strong_past_markers = [
+            " former ",
+            " formerly ",
+            " previous ",
+            " previously ",
+            " retired ",
+            " emeritus ",
+            " was a ",
+            " was an ",
+            " was the ",
+            " was professor ",
+            " was president ",
+            " was dean ",
+            " was director ",
+            " was chair ",
+            " was faculty ",
+            " was staff ",
+            " was student ",
+            " was member ",
+            " served as ",
+            " served from ",
+            " served until ",
+            " until ",
+            " stepped down ",
+            " left ",
+            " departed ",
+            " passed away ",
+            " died ",
+            " deceased ",
+            " the late ",
+        ]
+
+        has_current_language = _has_phrase(evidence_text_lower, strong_current_markers)
+        has_past_language = _has_phrase(evidence_text_lower, strong_past_markers)
+        mentions_present = "present" in evidence_text_lower
+
+        # Rule 1: downgrade "current" to "past" if we clearly see past-tense cues or old end dates
+        if classification == "current":
+            downgrade_reasons: List[str] = []
+
+            if has_past_language:
+                downgrade_reasons.append("past-tense language detected in supporting evidence")
+
+            if latest_year and latest_year < current_year - 1 and not mentions_present:
+                downgrade_reasons.append(f"latest year mention is {latest_year}")
+
+            if downgrade_reasons:
                 updated = dict(decision)
+                updated["relationship_timeframe"] = "past"
                 updated["current_or_past"] = "past"
-                conf = updated.get("confidence", "medium").lower()
-                if conf == "high":
+                if updated.get("confidence", "").lower() == "high":
                     updated["confidence"] = "medium"
-                
-                evidence = updated.get("temporal_evidence", "").strip()
-                if len(target_urls_with_end_dates) >= 2:
-                    extra = f"Position clearly ended based on dates in {len(target_urls_with_end_dates)} sources"
-                elif inferred_past >= 3:
-                    extra = f"Strong date-based evidence of past affiliation ({inferred_past} sources)"
-                else:
-                    extra = "Evidence shows past affiliation and current position elsewhere"
-                
-                updated["temporal_evidence"] = f"{evidence}; {extra}" if evidence else extra
-                return updated
-        
-        # Rule 2: If LLM says past, but we have VERY STRONG current evidence
-        elif current_classification == "past":
-            # Strong current evidence: multiple recent indicators
-            strong_current_evidence = (
-                len(target_recent_years) >= 3 or  # Multiple recent year mentions
-                inferred_current >= 3 or  # Multiple results infer current
-                (inferred_current >= 2 and target_current_count >= 5)  # Inference + signals
-            )
-            
-            if strong_current_evidence:
-                updated = dict(decision)
-                updated["current_or_past"] = "current"
-                
-                evidence = updated.get("temporal_evidence", "").strip()
-                if len(target_recent_years) >= 3:
-                    years_str = ", ".join(str(y) for y in sorted(set(target_recent_years))[:3])
-                    extra = f"Strong recent activity found ({years_str})"
-                elif inferred_current >= 3:
-                    extra = f"Multiple sources ({inferred_current}) indicate current affiliation"
-                else:
-                    extra = f"Strong current indicators with recent dates"
-                
-                updated["temporal_evidence"] = f"{evidence}; {extra}" if evidence else extra
+                note = "; ".join(downgrade_reasons)
+                existing = _safe_text(updated.get("temporal_context"))
+                merged = f"{existing}; {note}" if existing else note
+                updated["temporal_context"] = merged
+                updated["temporal_evidence"] = merged
                 return updated
 
-        # NEW: Source quality-based confidence adjustment
-        # Score the quality of the supporting_url
-        supporting_url = decision.get("supporting_url", "")
+        # Rule 2: upgrade "past" to "current" only when evidence explicitly says so
+        elif classification == "past":
+            upgrade_reasons: List[str] = []
+
+            if has_current_language or mentions_present:
+                upgrade_reasons.append("explicit present-tense language detected")
+
+            if latest_year and latest_year >= current_year - 1:
+                upgrade_reasons.append(f"recent year mention {latest_year}")
+
+            # Do not override if we simultaneously see strong past cues
+            if upgrade_reasons and not has_past_language:
+                updated = dict(decision)
+                updated["relationship_timeframe"] = "current"
+                updated["current_or_past"] = "current"
+                existing = _safe_text(updated.get("temporal_context"))
+                note = "; ".join(upgrade_reasons)
+                merged = f"{existing}; {note}" if existing else note
+                updated["temporal_context"] = merged
+                updated["temporal_evidence"] = merged
+                return updated
+
+        # Adjust confidence based on supporting URL quality
         if supporting_url and decision.get("connected") == "Y":
             domain = _extract_domain(supporting_url)
             url_quality = _score_url_quality(supporting_url, domain)
             current_confidence = decision.get("confidence", "medium").lower()
-            
-            # Downgrade confidence based on source quality
-            if url_quality == "low":
-                # LOW quality sources: max confidence is "low"
-                if current_confidence in ["high", "medium"]:
+
+            if url_quality == "low" and current_confidence in ["high", "medium"]:
+                updated = dict(decision)
+                updated["confidence"] = "low"
+                return updated
+
+            if url_quality == "medium" and current_confidence == "high":
+                high_quality_count = sum(
+                    1
+                    for r in results or []
+                    if _score_url_quality(r.get("url", ""), _extract_domain(r.get("url", ""))) == "high"
+                )
+                if high_quality_count < 2:
                     updated = dict(decision)
-                    updated["confidence"] = "low"
+                    updated["confidence"] = "medium"
                     return updated
-            
-            elif url_quality == "medium":
-                # MEDIUM quality sources: max confidence is "medium"
-                if current_confidence == "high":
-                    # Check if we have multiple high-quality sources
-                    high_quality_count = sum(
-                        1 for r in results or []
-                        if _score_url_quality(r.get("url", ""), _extract_domain(r.get("url", ""))) == "high"
-                    )
-                    # Only keep "high" if we have 2+ high-quality sources
-                    if high_quality_count < 2:
-                        updated = dict(decision)
-                        updated["confidence"] = "medium"
-                        return updated
-            
-            # If url_quality == "high" and it's a .edu, we can keep high confidence
-            # But ONLY if the connection_detail has explicit evidence (checked by LLM prompt)
 
         return decision
     except Exception:
         return decision
 
 
+def _auto_rescue_decision(
+    decision: Dict[str, str],
+    name: str,
+    institution: str,
+    results: List[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """If the LLM said no connection, try to rescue using deterministic evidence."""
+    if decision.get("connected") == "Y":
+        return None
+    evidence = _find_search_evidence(name, institution, results)
+    if not evidence:
+        return None
+    connection_type, detail, url, confidence = evidence
+    raw_payload = {
+        "verdict": "connected",
+        "relationship_type": connection_type,
+        "relationship_timeframe": "past",
+        "verification_detail": detail or f"Auto-confirmed {connection_type.lower()} evidence",
+        "summary": f"Deterministically confirmed {connection_type.lower()} link via search heuristic.",
+        "primary_source": url,
+        "confidence": confidence,
+        "verification_status": "verified" if confidence == "high" else "needs_review",
+        "temporal_context": detail,
+    }
+    return _normalize_decision(raw_payload)
+
+
 def _validate_decision(decision: Dict[str, str], name: str, institution: str) -> bool:
     """Validate that the decision makes logical sense."""
-    # Check required fields exist and have valid values
+    verdict = decision.get("verdict", "")
+    if verdict not in {"connected", "not_connected", "uncertain"}:
+        return False
+    
     connected = decision.get("connected", "")
-    if connected not in ["Y", "N"]:
+    if connected not in {"Y", "N"}:
         return False
-    
-    current_or_past = decision.get("current_or_past", "")
-    if current_or_past not in ["current", "past", "N/A"]:
+    if verdict == "connected" and connected != "Y":
         return False
-    
+    if verdict != "connected" and connected != "N":
+        return False
+
+    relationship_timeframe = decision.get("relationship_timeframe", "")
+    if relationship_timeframe not in {"current", "past", "unknown"}:
+        return False
+
     confidence = decision.get("confidence", "")
     if confidence not in ["high", "medium", "low"]:
         return False
-    
-    # Validate connection_type
-    connection_type = decision.get("connection_type", "")
-    valid_connection_types = ["Alumni", "Attended", "Executive", "Faculty", "Postdoc", "Staff", "Visiting", "Other", "Others"]
-    if connection_type not in valid_connection_types:
+
+    relationship_type = decision.get("relationship_type", "")
+    valid_relationship_types = [
+        "Alumni",
+        "Attended",
+        "Executive",
+        "Faculty",
+        "Postdoc",
+        "Staff",
+        "Visiting",
+        "Other",
+        "None",
+    ]
+    legacy_type = decision.get("connection_type", "")
+
+    if relationship_type not in valid_relationship_types:
+        return False
+    if verdict == "connected" and relationship_type == "None":
+        return False
+    if verdict != "connected" and relationship_type not in {"None", "Other"}:
+        return False
+    if legacy_type and legacy_type not in [
+        "Alumni",
+        "Attended",
+        "Executive",
+        "Faculty",
+        "Postdoc",
+        "Staff",
+        "Visiting",
+        "Other",
+        "Others",
+    ]:
         return False
     
-    # If connected, must have valid connection type (not "Others")
-    if connected == "Y" and connection_type == "Others":
+    verification_status = decision.get("verification_status", "")
+    if verification_status not in {"verified", "needs_review"}:
         return False
-    
-    # If not connected, must be "Others"
-    if connected == "N" and connection_type != "Others":
-        return False
-    
-    # If connected, must have details (relaxed requirement)
-    if connected == "Y":
-        detail = decision.get("connection_detail", "").strip()
-        if not detail or len(detail) < 5:  # Relaxed from 10 to 5
+
+    if verdict == "connected":
+        detail = _safe_text(decision.get("verification_detail"))
+        summary = _safe_text(decision.get("summary"))
+        if len(detail) < 5 and len(summary) < 5:
             return False
-        if "error" in detail.lower():  # Removed "unable to determine" check - that can be valid
+        if "error" in detail.lower() or "error" in summary.lower():
             return False
-        # Must specify current or past
-        if current_or_past == "N/A":
+        if relationship_timeframe not in {"current", "past", "unknown"}:
             return False
-    
-    # Relaxed validation for "N" responses - removed suspicious checks that may reject valid responses
-    if connected == "N" and current_or_past != "N/A":
+    else:
+        if relationship_timeframe not in {"unknown"}:
+            return False
+
+    if verdict != "connected":
+        temporal_context = _safe_text(decision.get("temporal_context"))
+        if temporal_context and "error" not in temporal_context.lower():
+            # For a "no" verdict, temporal context should usually be 'unknown' or contain rationale
+            pass
+
+    # Legacy checks for backward compatibility
+    current_or_past = decision.get("current_or_past", "")
+    if current_or_past not in ["current", "past", "N/A"]:
         return False
     
     return True
 
 
 def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict[str, Any]]) -> Optional[str]:
-    """Detect common false positive patterns and AUTO-REJECT them.
-    
-    This function will CHANGE connected="Y" to "N" for obvious false positives.
+    """Detect common false positive patterns and downgrade confidence if necessary.
     
     Returns:
         Rejection reason if a false positive pattern is detected, None otherwise
@@ -1069,8 +1566,8 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     if decision.get("connected") != "Y":
         return None  # Only check positive connections
     
-    detail = decision.get("connection_detail", "").lower()
-    connection_type = decision.get("connection_type", "")
+    detail = _safe_text(decision.get("verification_detail") or decision.get("summary")).lower()
+    connection_type = decision.get("relationship_type") or decision.get("connection_type", "")
     
     # Collect all text for pattern matching
     all_text = detail + " "
@@ -1078,6 +1575,9 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
         title = _safe_text(result.get("title", "")).lower()
         snippet = _safe_text(result.get("snippet", "")).lower()
         all_text += f" {title} {snippet}"
+
+    context_warnings: List[str] = []
+    critical_issues: List[str] = []
     
     # Pattern 1: Event participation (HIGHEST PRIORITY - very common false positive)
     event_terms = [
@@ -1086,15 +1586,11 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
         "axelrod", "lecture series", "colloquium", "invited talk", "talk at"
     ]
     for term in event_terms:
-        if term in detail or term in all_text:
-            # Unless it's explicitly a Visiting appointment with formal term
+        if term in detail:
             if connection_type != "Visiting" and "visiting professor" not in detail and "visiting scholar" not in detail:
-                # AUTO-REJECT
-                decision["connected"] = "N"
-                decision["connection_type"] = "Others"
-                decision["connection_detail"] = f"REJECTED: Event participation ({term}) is not an official connection"
-                decision["confidence"] = "low"
-                return f"AUTO-REJECTED: Event participation detected ({term})"
+                critical_issues.append(f"Evidence references event participation term '{term}'")
+        elif term in all_text:
+            context_warnings.append(f"Search context mentions event participation term '{term}'")
     
     # Pattern 2: Press/publication prizes
     press_prize_terms = [
@@ -1102,15 +1598,11 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     ]
     for term in press_prize_terms:
         if term in detail:
-            # Check if it's ONLY about prize, not actual employment
             employment_terms = ["professor", "faculty", "staff", "employee", "worked", "teaches", "graduated", "degree from"]
             if not any(emp_term in detail for emp_term in employment_terms):
-                # AUTO-REJECT
-                decision["connected"] = "N"
-                decision["connection_type"] = "Others"
-                decision["connection_detail"] = f"REJECTED: Press/publication prize ({term}) is not an affiliation"
-                decision["confidence"] = "low"
-                return f"AUTO-REJECTED: Press prize detected ({term})"
+                critical_issues.append(f"Evidence only references prize term '{term}' without employment")
+        elif term in all_text:
+            context_warnings.append(f"Search context references prize term '{term}' without appearing in evidence detail")
     
     # Pattern 3: Publishing relationships
     publishing_terms = [
@@ -1119,15 +1611,11 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     ]
     for term in publishing_terms:
         if term in detail:
-            # Check if it's ONLY about publishing, not actual employment
             employment_terms = ["professor", "faculty", "staff", "employee", "worked", "teaches", "graduated", "degree from"]
             if not any(emp_term in detail for emp_term in employment_terms):
-                # AUTO-REJECT
-                decision["connected"] = "N"
-                decision["connection_type"] = "Others"
-                decision["connection_detail"] = f"REJECTED: Publishing relationship ({term}) is not an affiliation"
-                decision["confidence"] = "low"
-                return f"AUTO-REJECTED: Publishing relationship detected ({term})"
+                critical_issues.append(f"Evidence references publishing term '{term}' without employment markers")
+        elif term in all_text:
+            context_warnings.append(f"Publishing-related phrase '{term}' seen in search context")
     
     # Pattern 4: External advisory roles / External boards
     external_board_terms = [
@@ -1137,15 +1625,11 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     ]
     for term in external_board_terms:
         if term in detail:
-            # Check if it's an external organization's board (e.g., "Board of X at Purdue" where X is external org)
             external_org_indicators = ["foundation", "institute at", "center at", "board of trustees of"]
             if any(indicator in detail for indicator in external_org_indicators):
-                # AUTO-REJECT
-                decision["connected"] = "N"
-                decision["connection_type"] = "Others"
-                decision["connection_detail"] = f"REJECTED: External organization board ({term}) is not institutional employment"
-                decision["confidence"] = "low"
-                return f"AUTO-REJECTED: External board detected ({term})"
+                critical_issues.append(f"Evidence focuses on external board term '{term}'")
+        elif term in all_text:
+            context_warnings.append(f"External board phrase '{term}' detected in search context")
     
     # Pattern 5: Weak inference without explicit statement
     weak_inference_terms = [
@@ -1155,46 +1639,57 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     ]
     for term in weak_inference_terms:
         if term in detail:
-            # Check if there's an explicit statement of employment or degree
             explicit_terms = [
                 "professor at", "faculty at", "graduated from", "degree from",
                 "earned", "received", "employed at", "works at", "president of",
                 "dean of", "director of"
             ]
             if not any(explicit_term in detail for explicit_term in explicit_terms):
-                # AUTO-REJECT
-                decision["connected"] = "N"
-                decision["connection_type"] = "Others"
-                decision["connection_detail"] = f"REJECTED: Weak inference ({term}) without explicit employment/degree statement"
-                decision["confidence"] = "low"
-                return f"AUTO-REJECTED: Weak inference detected ({term})"
+                critical_issues.append(f"Evidence uses weak phrasing '{term}' without explicit employment/degree")
+        elif term in all_text:
+            context_warnings.append(f"Weak phrasing '{term}' found in search context")
     
     # Pattern 6: Joint campus mentions (IUPUI/IUPFW)
     from .config import JOINT_CAMPUS_PATTERNS, ACCEPT_JOINT_CAMPUSES
     if not ACCEPT_JOINT_CAMPUSES:
-        if any(pattern in all_text for pattern in JOINT_CAMPUS_PATTERNS):
-            # Check if it's clearly IUPUI/IUPFW vs Purdue main
-            if "iupui" in all_text or "iupfw" in all_text:
-                # AUTO-REJECT
-                decision["connected"] = "N"
-                decision["connection_type"] = "Others"
-                decision["connection_detail"] = "REJECTED: IUPUI/IUPFW is a joint IU-Purdue campus, not Purdue main campus"
-                decision["confidence"] = "low"
-                return "AUTO-REJECTED: Joint campus (IUPUI/IUPFW) detected"
+        if any(pattern in detail for pattern in JOINT_CAMPUS_PATTERNS):
+            if "iupui" in detail or "iupfw" in detail:
+                critical_issues.append("Evidence references IUPUI/IUPFW joint campus rather than Purdue main campus")
+        elif any(pattern in all_text for pattern in JOINT_CAMPUS_PATTERNS):
+            context_warnings.append("Joint campus language detected in search context")
     
     # Pattern 7: Honorary degrees (without other connections)
     honorary_terms = ["honorary degree", "honorary doctorate", "honoris causa"]
     if any(term in detail for term in honorary_terms):
-        # Check if there's mention of actual study or employment
         genuine_terms = ["earned degree", "phd from", "bachelor from", "master from", "graduated", "professor", "faculty", "employed"]
         if not any(term in detail for term in genuine_terms):
-            # AUTO-REJECT
-            decision["connected"] = "N"
-            decision["connection_type"] = "Others"
-            decision["connection_detail"] = "REJECTED: Honorary degree alone is not an earned degree or employment"
-            decision["confidence"] = "low"
-            return "AUTO-REJECTED: Honorary degree only"
-    
+            critical_issues.append("Evidence refers to honorary degree without earned degree/employment")
+    elif any(term in all_text for term in honorary_terms):
+        context_warnings.append("Honorary degree phrasing appears in search context")
+
+    if critical_issues or context_warnings:
+        confidence = decision.get("confidence", "medium").lower()
+        issues_summary = []
+        if critical_issues:
+            issues_summary.extend(critical_issues)
+            if confidence != "low":
+                decision["confidence"] = "low"
+            note = " | ".join(critical_issues)
+            existing = _safe_text(decision.get("temporal_context"))
+            merged = f"{existing}; Flagged by heuristics: {note}" if existing else f"Flagged by heuristics: {note}"
+            decision["temporal_context"] = merged
+            decision["temporal_evidence"] = merged
+        elif context_warnings:
+            issues_summary.extend(context_warnings)
+            if confidence == "high":
+                decision["confidence"] = "medium"
+            note = " | ".join(context_warnings)
+            existing = _safe_text(decision.get("temporal_context"))
+            merged = f"{existing}; Heuristic warning: {note}" if existing else f"Heuristic warning: {note}"
+            decision["temporal_context"] = merged
+            decision["temporal_evidence"] = merged
+        return "; ".join(dict.fromkeys(issues_summary))
+
     return None
 
 
@@ -1204,8 +1699,8 @@ async def analyze_connection(
     results: List[Dict[str, Any]],
     *,
     debug: bool = False,
-    max_retries: int = 2,
-    per_attempt_timeout: float = 45.0,  # Increased from 30s to 45s for thinking models
+    max_retries: int = 3,
+    per_attempt_timeout: float = 90.0,  # Increased to 90s for better reliability
 ) -> Dict[str, str]:
     """Analyze connection with retries and per-attempt timeout.
     
@@ -1214,12 +1709,18 @@ async def analyze_connection(
         institution: Institution to check
         results: Search results
         debug: Enable debug output
-        max_retries: Maximum retry attempts
-        per_attempt_timeout: Maximum seconds per LLM API call (default 45s)
+        max_retries: Maximum retry attempts (default 3)
+        per_attempt_timeout: Maximum seconds per LLM API call (default 90s)
     """
     name = _safe_text(name)
     institution = _safe_text(institution)
+
     prompt = _build_prompt(name, institution, results or [])
+    if debug or _PROMPT_LOGGING_ENABLED:
+        separator = "=" * 48
+        print(f"{separator}\n[LLM PROMPT] {name} ↔ {institution}\n{separator}")
+        print(prompt)
+        print(f"{separator}\n[END PROMPT]\n{separator}")
 
     last_error: Optional[str] = None
     
@@ -1228,17 +1729,26 @@ async def analyze_connection(
             if debug and attempt > 1:
                 print(f"[LLM] Retry attempt {attempt}/{max_retries}")
             
-            # Add per-attempt timeout
+            # Add per-attempt timeout with exponential backoff
+            timeout = per_attempt_timeout * (1.5 ** (attempt - 1))  # Increase timeout on retries
             try:
                 # Use temperature 0.2 for better consistency while allowing some flexibility
                 parsed = await asyncio.wait_for(
                     _call_llm(prompt, debug=debug, temperature=0.2),
-                    timeout=per_attempt_timeout
+                    timeout=timeout
                 )
             except asyncio.TimeoutError:
                 if debug:
-                    print(f"[LLM] Attempt {attempt} timed out after {per_attempt_timeout}s")
-                raise RuntimeError(f"LLM call timed out after {per_attempt_timeout}s")
+                    print(f"[LLM] Attempt {attempt} timed out after {timeout}s")
+                if attempt < max_retries:
+                    # Exponential backoff before retry
+                    delay = min(2.0 * attempt, 5.0)
+                    if debug:
+                        print(f"[LLM] Waiting {delay}s before retry...")
+                    await asyncio.sleep(delay)
+                    await refresh_session()
+                    continue
+                raise RuntimeError(f"LLM call timed out after {timeout}s")
             
             decision = _normalize_decision(parsed)
             
@@ -1247,7 +1757,11 @@ async def analyze_connection(
                 if debug:
                     print(f"[LLM] Decision failed validation: {decision}")
                 if attempt < max_retries:
-                    await asyncio.sleep(1.0)
+                    delay = 1.0 * attempt
+                    if debug:
+                        print(f"[LLM] Waiting {delay}s before retry...")
+                    await asyncio.sleep(delay)
+                    await refresh_session()
                     continue
                 # On last attempt, try to salvage if connected=Y
                 if decision.get("connected") == "Y":
@@ -1265,13 +1779,22 @@ async def analyze_connection(
                 if debug:
                     print(f"[LLM] {warning}")
                 # Add warning to temporal_evidence for user visibility
-                existing_evidence = decision.get("temporal_evidence", "")
-                decision["temporal_evidence"] = f"{existing_evidence}; {warning}" if existing_evidence else warning
+                existing_evidence = decision.get("temporal_context", "")
+                merged = f"{existing_evidence}; {warning}" if existing_evidence else warning
+                decision["temporal_context"] = merged
+                decision["temporal_evidence"] = merged
                 # Reduce confidence if high
                 if decision.get("confidence") == "high":
                     decision["confidence"] = "medium"
                     if debug:
                         print(f"[LLM] Reduced confidence to medium due to false positive pattern")
+            # Disabled: Trust LLM decision 99.9% of the time
+            # elif decision.get("connected") != "Y":
+            #     rescued = _auto_rescue_decision(decision, name, institution, results or [])
+            #     if rescued:
+            #         if debug:
+            #             print(f"[LLM] Auto-rescued connection using deterministic evidence: {rescued}")
+            #         return rescued
             
             if debug:
                 print(f"[LLM] Analysis complete: {decision}")
@@ -1284,13 +1807,23 @@ async def analyze_connection(
                 print(f"[LLM] Attempt {attempt} failed: {exc}")
             
             if attempt < max_retries:
-                await asyncio.sleep(1.5)
+                # Exponential backoff
+                delay = min(1.5 * attempt, 4.0)
+                if debug:
+                    print(f"[LLM] Waiting {delay}s before retry...")
+                await asyncio.sleep(delay)
                 await refresh_session()
                 continue
             break
 
     # Failed after retries
     error_result = _build_error(last_error or "LLM analysis failed")
+    # Disabled: Trust LLM, only rescue on complete failure as last resort
+    # rescue_on_error = _auto_rescue_decision({"connected": "N"}, name, institution, results or [])
+    # if rescue_on_error:
+    #     if debug:
+    #         print("[LLM] Auto-rescued connection after error using deterministic evidence")
+    #     return rescue_on_error
     if debug:
         print(f"[LLM] All attempts failed, returning error result")
     return error_result

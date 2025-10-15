@@ -83,7 +83,7 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
                 # Try basic search first (faster, less redundant)
                 query = f'"{name}" "{INSTITUTION}"'
                 print(f"[PROGRESS] Trying basic search first for efficiency...")
-                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
                 
                 # Evaluate if we need enhanced search
                 # Check for high-quality results with strong signals
@@ -99,7 +99,7 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
                 
                 if needs_enhanced:
                     print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
-                    results = await enhanced_search(name, INSTITUTION, num_results=20, debug=debug)
+                    results = await enhanced_search(name, INSTITUTION, num_results=30, debug=debug)
                 else:
                     print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
                 
@@ -108,7 +108,7 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
                     print(f"[WARN] No results from either search method")
             else:
                 query = f'"{name}" {INSTITUTION}'
-                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
             
             search_elapsed = time.time() - search_start
             print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
@@ -168,7 +168,7 @@ async def process_name(name: str, use_enhanced_search: bool, debug: bool = False
             # Try basic search first (faster, less redundant)
             query = f'"{name}" "{INSTITUTION}"'
             print(f"[PROGRESS] Trying basic search first for efficiency...")
-            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
             
             # Evaluate if we need enhanced search
             # Check for high-quality results with strong signals
@@ -184,7 +184,7 @@ async def process_name(name: str, use_enhanced_search: bool, debug: bool = False
             
             if needs_enhanced:
                 print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
-                results = await enhanced_search(name, INSTITUTION, num_results=20, debug=debug)
+                results = await enhanced_search(name, INSTITUTION, num_results=30, debug=debug)
             else:
                 print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
             
@@ -193,7 +193,7 @@ async def process_name(name: str, use_enhanced_search: bool, debug: bool = False
                 print(f"[WARN] No results from either search method")
         else:
             query = f'"{name}" {INSTITUTION}'
-            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
+            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
         
         search_elapsed = time.time() - search_start
         print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
@@ -239,15 +239,19 @@ async def _process_name_with_timeout(name: str, use_enhanced_search: bool, debug
 
 def print_result_summary(result: Dict[str, str]) -> None:
     name = result.get("name", "")
-    connected = result.get("connected", "N")
-    if connected == "Y":
-        detail = result.get("connection_detail", "")
-        status = result.get("current_or_past", "N/A")
-        confidence = result.get("confidence", "medium")
-        conn_type = result.get("connection_type", "Other")
-        print(f"[OK] {name}: connected ({conn_type}, {status}, {confidence}) - {detail}")
+    verdict = result.get("verdict", "uncertain")
+    confidence = result.get("confidence", "medium")
+    summary = result.get("summary") or result.get("verification_detail") or "No explanation provided"
+    relationship_type = result.get("relationship_type") or result.get("connection_type", "Other")
+    timeframe = result.get("relationship_timeframe") or result.get("current_or_past", "unknown")
+    verification_status = result.get("verification_status", "needs_review")
+
+    if verdict == "connected":
+        print(f"[OK] {name}: {relationship_type} ({timeframe}, {confidence}, {verification_status}) - {summary}")
+    elif verdict == "not_connected":
+        print(f"[--] {name}: no verified connection ({confidence}, {verification_status}) - {summary}")
     else:
-        print(f"[--] {name}: no confirmed connection to {INSTITUTION}")
+        print(f"[??] {name}: inconclusive ({confidence}, {verification_status}) - {summary}")
 
 
 def build_error_result(name: str, error: Exception) -> Dict[str, str]:
@@ -255,37 +259,60 @@ def build_error_result(name: str, error: Exception) -> Dict[str, str]:
     return {
         "name": name,
         "institution": INSTITUTION,
+        "verdict": "not_connected",
         "connected": "N",
+        "relationship_type": "None",
+        "relationship_timeframe": "unknown",
+        "verification_detail": f"Error: {message}",
+        "summary": f"Processing error: {message}",
+        "primary_source": "",
+        "confidence": "low",
+        "verification_status": "needs_review",
+        "temporal_context": f"Processing error: {message}",
+        # Legacy aliases for backward compatibility
         "connection_type": "Others",
         "connection_detail": f"Error: {message}",
         "current_or_past": "N/A",
         "supporting_url": "",
-        "confidence": "low",
         "temporal_evidence": f"Processing error: {message}",
     }
 
 
 def has_error(result: Dict[str, str]) -> bool:
     """Check if a result contains an error in any field."""
-    # Check for explicit error markers
-    for field in ["temporal_evidence", "connection_detail"]:
-        value = str(result.get(field, ""))
-        # Only flag as error if it starts with "Error:" or contains "Processing error:"
+    # Check for explicit error markers in summary-related fields
+    error_fields = [
+        result.get("temporal_context", ""),
+        result.get("temporal_evidence", ""),
+        result.get("verification_detail", ""),
+        result.get("connection_detail", ""),
+        result.get("summary", ""),
+    ]
+    for raw in error_fields:
+        value = str(raw or "").strip()
+        if not value:
+            continue
         if value.startswith("Error:") or "Processing error:" in value:
             return True
-    
-    # Additional check: if confidence is missing or connection_detail is suspiciously short for a valid response
-    confidence = result.get("confidence", "").strip()
-    connection_detail = result.get("connection_detail", "").strip()
-    
-    # If confidence is missing or empty, it's likely malformed
-    if not confidence or confidence not in ["high", "medium", "low"]:
+
+    confidence = result.get("confidence", "").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
         return True
-    
-    # If connection_detail is too short (less than 10 chars) and not a clear "no connection" response
-    if len(connection_detail) < 10 and result.get("connected") == "Y":
-        return True
-    
+
+    verdict = result.get("verdict", "").strip()
+    relationship_timeframe = result.get("relationship_timeframe") or result.get("current_or_past", "")
+
+    if verdict == "connected":
+        detail = str(result.get("verification_detail") or result.get("connection_detail") or "").strip()
+        summary = str(result.get("summary") or "").strip()
+        if len(detail) < 5 and len(summary) < 5:
+            return True
+        if relationship_timeframe not in {"current", "past", "unknown"}:
+            return True
+    elif verdict == "not_connected":
+        if relationship_timeframe not in {"unknown", "N/A", ""}:
+            return True
+
     return False
 
 

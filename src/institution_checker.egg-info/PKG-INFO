@@ -39,24 +39,33 @@ The tool generates CSV files with the following columns:
 |--------|-------------|
 | `name` | The person's name being checked |
 | `institution` | The target institution (configured in `config.py`) |
-| `connected` | `Y` if connection found, `N` otherwise |
-| `connection_type` | Type of connection: `Alumni`, `Attended`, `Executive`, `Faculty`, `Postdoc`, `Staff`, `Other`, or `Others` (not connected) |
-| `connection_detail` | Brief explanation of the connection or reason for no connection |
-| `current_or_past` | `current` (active now), `past` (former affiliation), or `N/A` (not connected) |
-| `supporting_url` | URL providing evidence of the connection (if found) |
-| `confidence` | `high`, `medium`, or `low` - confidence level in the determination |
-| `temporal_evidence` | Time-based evidence with dates/years if available |
+| `verdict` | `connected`, `not_connected`, or `uncertain` — the overall decision |
+| `relationship_type` | Connection classification: `Alumni`, `Attended`, `Executive`, `Faculty`, `Postdoc`, `Staff`, `Visiting`, `Other`, or `None` |
+| `relationship_timeframe` | `current`, `past`, or `unknown` — whether the affiliation is ongoing |
+| `verification_detail` | Quoted evidence that proves (or rejects) the connection |
+| `summary` | One-sentence summary describing the decision and context |
+| `primary_source` | Best supporting URL (prefers official or authoritative sources) |
+| `confidence` | `high`, `medium`, or `low` — confidence level in the decision |
+| `verification_status` | `verified` when evidence is strong, otherwise `needs_review` |
+| `temporal_context` | Dates/years or temporal notes extracted from the evidence |
+| `connected` | Legacy boolean (`Y`/`N`) derived from `verdict` for backward compatibility |
+| `connection_type` | Legacy alias mirroring `relationship_type` (deprecated) |
+| `connection_detail` | Legacy alias mirroring `verification_detail` (deprecated) |
+| `current_or_past` | Legacy alias mirroring `relationship_timeframe` (deprecated) |
+| `supporting_url` | Legacy alias mirroring `primary_source` (deprecated) |
+| `temporal_evidence` | Legacy alias mirroring `temporal_context` (deprecated) |
 
-#### Connection Type Categories
+#### Relationship Type Categories
 
 - **Alumni**: Graduated from the institution (undergraduate, graduate, or professional degree)
-- **Attended**: Studied at the institution but did not complete degree, or unclear if graduated
+- **Attended**: Studied at the institution but did not complete a degree, or the degree is unclear
 - **Executive**: Administrator, president, dean, director, or other leadership position
 - **Faculty**: Professor, instructor, lecturer, or teaching position
 - **Postdoc**: Postdoctoral researcher or fellow
 - **Staff**: Non-teaching employee (researcher, technician, support staff)
+- **Visiting**: Visiting professor/scholar with a temporary appointment
 - **Other**: Official connection but none of the above categories fit
-- **Others**: No connection found (used when `connected` = `N`)
+- **None**: No verified connection (used when `verdict` = `not_connected`)
 
 ### Output Files
 
@@ -68,29 +77,33 @@ The tool creates the following files in the `data/` directory:
 ### Example Output
 
 ```csv
-name,institution,connected,connection_type,connection_detail,current_or_past,supporting_url,confidence,temporal_evidence
-Jane Doe,Purdue University,Y,Faculty,Professor of Computer Science in the Department of CS,current,https://www.cs.purdue.edu/people/faculty/janedoe,high,Currently listed on faculty page as of 2025
-John Smith,Purdue University,N,Others,No verifiable connection found in search results,N/A,,low,No temporal evidence found
-Bob Johnson,Purdue University,Y,Alumni,PhD in Electrical Engineering completed in 2018,past,https://engineering.purdue.edu/ECE/Alumni/Distinguished/johnson,high,Graduated 2018; multiple references to degree completion
-Mary Williams,Purdue University,Y,Executive,Former Dean of the College of Engineering from 2015-2022,past,https://www.purdue.edu/newsroom/releases/2015/Q2/williams-named-dean.html,high,Served as Dean until 2022 based on news archives
+name,institution,verdict,relationship_type,relationship_timeframe,verification_detail,summary,primary_source,confidence,verification_status,temporal_context
+Jane Doe,Purdue University,connected,Faculty,current,"She is currently a Professor of Computer Science at Purdue University.","Confirmed faculty listing in present tense.",https://www.cs.purdue.edu/people/faculty/janedoe,high,verified,"Listed as active faculty 2025"
+John Smith,Purdue University,not_connected,None,unknown,"Search results do not confirm an earned degree or employment with Purdue University.","No verified institutional relationship discovered.",,low,needs_review,unknown
+Bob Johnson,Purdue University,connected,Alumni,past,"He earned a PhD in Electrical Engineering from Purdue in 2018.","Alumni record confirms earned PhD in 2018.",https://engineering.purdue.edu/ECE/Alumni/Distinguished/johnson,high,verified,"PhD completed 2018"
+Mary Williams,Purdue University,connected,Executive,past,"She served as Dean of the College of Engineering from 2015 to 2022.","Former dean with service ending in 2022.",https://www.purdue.edu/newsroom/releases/2015/Q2/williams-named-dean.html,high,verified,"Dean 2015-2022"
 ```
 
 ### Understanding Results
 
-**Connected (Y/N)**
-- `Y` indicates a verified institutional connection (employment, student/alumni, official role)
-- `N` means no confirmed connection was found
-- Honorary degrees, guest lectures, or news mentions alone do NOT count as connections
+**Verdict**
+- `connected`: Strong evidence confirms a past or present institutional relationship
+- `not_connected`: No qualifying connection found in the evidence
+- `uncertain`: Evidence is inconclusive — manual review recommended
 
-**Current vs Past**
-- `current`: Person is actively affiliated now (based on present tense language, recent dates, current listings)
-- `past`: Person had a former affiliation (based on past tense, ended date ranges, "former" language)
-- `N/A`: Not applicable (no connection found)
+**Relationship timeframe**
+- `current`: Person is actively affiliated now (present tense language, current directories)
+- `past`: Person previously held the affiliation (past tense, end dates, "former" language)
+- `unknown`: Evidence confirms the connection but lacks precise timing cues
 
 **Confidence Levels**
 - `high`: Strong, clear evidence from authoritative sources (e.g., official faculty pages)
 - `medium`: Good evidence but with some ambiguity
 - `low`: Weak or unclear evidence, or no connection found
+
+**Legacy columns**
+
+The CSV still includes the older fields (`connected`, `connection_type`, `connection_detail`, `current_or_past`, `supporting_url`, `temporal_evidence`) for backward compatibility. They mirror the new schema and will be deprecated in a future release.
 
 ## Configuration
 
@@ -344,7 +357,7 @@ The output columns are designed for automated evaluation:
 - Compare `connected` against ground truth to measure precision/recall
 - Compare `current_or_past` for temporal accuracy
 - Use `confidence` to analyze model certainty
-- Review `temporal_evidence` and `connection_detail` for error analysis
+- Review `temporal_context` and `verification_detail` for error analysis
 
 If you need to add evaluation columns (e.g., `all correct`, `connection correct`, `type correct`, `temporal correct`), you can merge the output with your ground truth data using pandas or Excel.
 
