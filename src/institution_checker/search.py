@@ -17,7 +17,7 @@ try:
 except ImportError:
     FTFY_AVAILABLE = False
 
-from .config import BROWSER_ARGS, ACCEPT_JOINT_CAMPUSES, JOINT_CAMPUS_PATTERNS
+from .config import BROWSER_ARGS, ACCEPT_JOINT_CAMPUSES, JOINT_CAMPUS_PATTERNS, CURRENT_TERMS, PAST_TERMS
 
 try:
     from pyppeteer import launch
@@ -64,26 +64,7 @@ SELECTORS = [
     "[data-idx]",
 ]
 
-CURRENT_TERMS = ["currently", "current", "now", "presently", "serving as", "now at", "active"]
-PAST_TERMS = [
-    "former",
-    "previous",
-    "previously",
-    "retired",
-    "emeritus",
-    "alumni",
-    "alumnus",
-    "alumna",
-    "alum",
-    "graduated",
-    "graduate of",
-    "was at",
-    "worked at",
-    "served as",
-    "left",
-    "departed",
-    "ex-",
-]
+# CURRENT_TERMS and PAST_TERMS are now imported from config.py
 ACADEMIC_TERMS = [
     "assistant professor",
     "associate professor",

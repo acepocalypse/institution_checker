@@ -11,21 +11,30 @@ from urllib.parse import urlparse
 import aiohttp
 import unicodedata
 
-from .config import get_api_key, LLM_API_URL, MODEL_NAME
+from .config import get_api_key, LLM_API_URL, MODEL_NAME, CURRENT_TERMS, PAST_TERMS
 
 _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 _last_refresh_time = 0.0
 _PROMPT_LOGGING_ENABLED = False
 
-MAX_RESULTS_FOR_PROMPT = 12  # Reduced from 18 for faster, more consistent responses
+MAX_RESULTS_FOR_PROMPT = 15 # Reduced from 18 for faster, more consistent responses
 
 # STRICT EVIDENCE-BASED PROMPT - Balanced for speed and accuracy
 PROMPT_TEMPLATE = """You are an evidence-driven verifier confirming whether {name} has a past or present relationship with {institution}. Read all {max_results} search findings below and decide if there is a real connection.
 
-Confirm a connection only when the evidence explicitly states an earned degree or a formal institutional role (faculty, staff, executive, director, postdoc, visiting). Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the line that proves the connection.
+CONNECTED: Return verdict="connected" when the evidence shows:
+1. Alumni: Earned degree (Bachelor, Master, PhD, etc.)
+2. Attended: Enrolled/studied without earning a degree
+3. Executive/Faculty/Staff: Formal institutional employment or leadership role
+4. Postdoc: Postdoctoral position
+5. Visiting: Visiting scholar, visiting professor, or similar temporary academic role
 
-Mark the relationship as "not_connected" when the evidence is limited to honorary awards, invited talks, external boards, publications, joint campuses (unless policy allows), or vague associations. Alumni requires an earned degree. "Attended" means studied without a confirmed degree. Use "current" when the language is present tense or references this year/{prior_year}; otherwise choose "past". Pick "unknown" when the timeframe cannot be inferred.
+NOT_CONNECTED: Return verdict="not_connected" only for honorary awards, invited talks, external boards, publications, joint campuses (unless policy allows), or vague associations with no institutional relationship.
+
+Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the evidence that supports your verdict.
+
+Use "current" when the language is present tense or references this year/{prior_year}; otherwise choose "past". Pick "unknown" when the timeframe cannot be inferred.
 
 Return JSON only (no markdown) using this schema:
 {{
@@ -43,47 +52,16 @@ Return JSON only (no markdown) using this schema:
 Search findings:
 {search_findings}"""
 
-DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=15, sock_read=150)
+DEFAULT_CLIENT_TIMEOUT = aiohttp.ClientTimeout(
+    total=240,      # Increased from 180 to 240s for total request time
+    connect=30,     # Increased from 15 to 30s for connection establishment  
+    sock_read=180   # Increased from 150 to 180s for reading response
+)
 JSON_BLOCK_RE = re.compile(r"```(?:json)?(.*?)```", re.DOTALL | re.IGNORECASE)
 JSON_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
-CURRENT_TERMS = [
-    "currently",
-    "current",
-    "now",
-    "presently",
-    "serving as",
-    "now at",
-    "active",
-    "as of",
-    "is a",
-    "is an",
-    "works at",
-    "working at",
-    "employed",
-]
-PAST_TERMS = [
-    "former",
-    "previous",
-    "previously",
-    "retired",
-    "emeritus",
-    "alumni",
-    "was at",
-    "was a",
-    "worked at",
-    "served as",
-    "left",
-    "departed",
-    "ex-",
-    "until",
-    "passed away",
-    "died",
-    "late",
-    "deceased",
-]
-
+# CURRENT_TERMS and PAST_TERMS are now imported from config.py
 # Add year pattern for temporal detection
 YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
 # Pattern for date ranges like "2010-2015" or "2010 - 2015"
@@ -431,7 +409,11 @@ def _normalize_connected(verdict: str) -> str:
 
 
 def _normalize_connection_type(value: Any, verdict: str) -> str:
-    """Normalize connection type to valid options."""
+    """Normalize connection type to valid options.
+    
+    Note: Attended and Alumni are valid connection types and should be preserved
+    even if the verdict is uncertain or not_connected in edge cases.
+    """
     text = _safe_text(value).strip()
     if verdict != "connected":
         return "None"
@@ -888,8 +870,8 @@ def _parse_response(raw: str) -> Dict[str, Any]:
     )
 
 
-async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.2) -> Dict[str, Any]:
-    """Call LLM with moderate temperature for consistent but flexible reasoning."""
+async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
+    """Call LLM with temperature 0 for fully deterministic outputs."""
     session = await get_session()
     headers = {
         "Authorization": f"Bearer {get_api_key()}",
@@ -904,115 +886,103 @@ async def _call_llm(prompt: str, debug: bool = False, temperature: float = 0.2) 
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": temperature,
+        "temperature": 0,  # Deterministic output
         "stream": False,
     }
 
-    attempt_payloads: List[Dict[str, Any]] = [
-        dict(base_payload),  # Try without response_format first
-        {**base_payload, "temperature": 0.3},  # Try slightly higher temperature
-        {**base_payload, "temperature": 0.1},  # Try lower temperature
-    ]
+    # Single payload attempt - retries are handled at a higher level in analyze_connection
+    payload = dict(base_payload)
     last_error_text: Optional[str] = None
     
-    for idx, payload in enumerate(attempt_payloads):
-        if debug and idx > 0:
-            print(f"[LLM] Trying payload variant {idx + 1}/{len(attempt_payloads)}")
-            
-        async with session.post(LLM_API_URL, json=payload, headers=headers) as response:
-            text = await response.text()
-            last_error_text = text
+    # Make single API call with provided temperature
+    async with session.post(LLM_API_URL, json=payload, headers=headers) as response:
+        text = await response.text()
+        last_error_text = text
 
+        if debug:
+            print(f"[LLM] Response status: {response.status}")
+            print(f"[LLM] Response length: {len(text)} chars")
+
+        if response.status >= 500:
+            raise RuntimeError(f"LLM server error {response.status}: {text[:200]}")
+
+        if response.status >= 400:
+            raise RuntimeError(f"LLM request failed ({response.status}): {text[:200]}")
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
             if debug:
-                print(f"[LLM] Response status: {response.status}")
-                print(f"[LLM] Response length: {len(text)} chars")
+                print("[LLM] Failed to parse server response as JSON")
+            raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
 
-            if response.status >= 500:
-                raise RuntimeError(f"LLM server error {response.status}: {text[:200]}")
+        # Debug: Print full API response structure
+        if debug:
+            print(f"[LLM DEBUG] Full API response keys: {list(data.keys())}")
+            print(f"[LLM DEBUG] Full API response: {json.dumps(data, indent=2)}")
 
-            if response.status >= 400:
-                if "response_format" in payload:
-                    # retry once more without response_format in case the endpoint does not support it
-                    continue
-                raise RuntimeError(f"LLM request failed ({response.status}): {text[:200]}")
-
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError as exc:
-                if debug:
-                    print("[LLM] Failed to parse server response as JSON")
-                raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
-
-            # Debug: Print full API response structure
+        choices = data.get("choices") or []
+        if not choices:
             if debug:
-                print(f"[LLM DEBUG] Full API response keys: {list(data.keys())}")
-                print(f"[LLM DEBUG] Full API response: {json.dumps(data, indent=2)}")
+                print("[LLM] No choices in response")
+            raise RuntimeError("LLM response contained no choices")
 
-            choices = data.get("choices") or []
-            if not choices:
-                if debug:
-                    print("[LLM] No choices in response")
-                raise RuntimeError("LLM response contained no choices")
-
-            message = choices[0].get("message", {})
-            
-            # Debug: Print the entire message structure
+        message = choices[0].get("message", {})
+        
+        # Debug: Print the entire message structure
+        if debug:
+            print(f"[LLM DEBUG] Message keys: {list(message.keys())}")
+            print(f"[LLM DEBUG] Full message structure: {json.dumps(message, indent=2)}")
+        
+        # For reasoning models, check if there's separate reasoning and content
+        reasoning = message.get("reasoning", "")
+        content = message.get("content", "")
+        
+        # If content looks like reasoning (doesn't start with {), try to extract JSON from it
+        content_stripped = content.strip()
+        if content_stripped and not content_stripped.startswith("{"):
             if debug:
-                print(f"[LLM DEBUG] Message keys: {list(message.keys())}")
-                print(f"[LLM DEBUG] Full message structure: {json.dumps(message, indent=2)}")
-            
-            # For reasoning models, check if there's separate reasoning and content
-            reasoning = message.get("reasoning", "")
-            content = message.get("content", "")
-            
-            # If content looks like reasoning (doesn't start with {), try to extract JSON from it
-            content_stripped = content.strip()
-            if content_stripped and not content_stripped.startswith("{"):
+                print("[LLM DEBUG] Content doesn't start with {, appears to be reasoning text")
+            # Try to find JSON object within the reasoning text
+            json_match = re.search(r'\{[^{}]*"verdict"[^{}]*\}', content, re.DOTALL)
+            if json_match:
+                extracted_json = json_match.group(0)
                 if debug:
-                    print("[LLM DEBUG] Content doesn't start with {, appears to be reasoning text")
-                # Try to find JSON object within the reasoning text
-                json_match = re.search(r'\{[^{}]*"verdict"[^{}]*\}', content, re.DOTALL)
-                if json_match:
-                    extracted_json = json_match.group(0)
-                    if debug:
-                        print(f"[LLM DEBUG] Extracted JSON from reasoning: {extracted_json}")
-                    content = extracted_json
-                else:
-                    if debug:
-                        print("[LLM DEBUG] No JSON object found in reasoning text, will attempt to construct from reasoning")
-            
+                    print(f"[LLM DEBUG] Extracted JSON from reasoning: {extracted_json}")
+                content = extracted_json
+            else:
+                if debug:
+                    print("[LLM DEBUG] No JSON object found in reasoning text, will attempt to construct from reasoning")
+        
+        if debug:
+            if reasoning:
+                print(f"[LLM] Reasoning length: {len(reasoning)} chars")
+                print(f"[LLM] Reasoning preview: {reasoning[:300]}...")
+            print(f"[LLM] Content length: {len(content)} chars")
+            if len(content) < 500:
+                print(f"[LLM] Full content: {content}")
+            else:
+                print(f"[LLM] Content preview: {content[:300]}...")
+            if not content.strip().endswith("}"):
+                print("[LLM] ??  WARNING: Response doesn't end with }, likely TRUNCATED")
+                print(f"[LLM] Last 200 chars: ...{content[-200:]}")
+
+        if debug or _PROMPT_LOGGING_ENABLED:
+            separator = "=" * 48
+            if reasoning:
+                print(f"{separator}\n[LLM REASONING]\n{separator}")
+                print(reasoning)
+                print(f"{separator}\n[END REASONING]\n{separator}")
+            print(f"{separator}\n[LLM RESPONSE (JSON)]\n{separator}")
+            print(content)
+            print(f"{separator}\n[END RESPONSE]\n{separator}")
+
+        if not content or not content.strip():
             if debug:
-                if reasoning:
-                    print(f"[LLM] Reasoning length: {len(reasoning)} chars")
-                    print(f"[LLM] Reasoning preview: {reasoning[:300]}...")
-                print(f"[LLM] Content length: {len(content)} chars")
-                if len(content) < 500:
-                    print(f"[LLM] Full content: {content}")
-                else:
-                    print(f"[LLM] Content preview: {content[:300]}...")
-                if not content.strip().endswith("}"):
-                    print("[LLM] ??  WARNING: Response doesn't end with }, likely TRUNCATED")
-                    print(f"[LLM] Last 200 chars: ...{content[-200:]}")
+                print(f"[LLM] Empty content received from API")
+            raise RuntimeError("LLM returned empty content")
 
-            if debug or _PROMPT_LOGGING_ENABLED:
-                separator = "=" * 48
-                if reasoning:
-                    print(f"{separator}\n[LLM REASONING]\n{separator}")
-                    print(reasoning)
-                    print(f"{separator}\n[END REASONING]\n{separator}")
-                print(f"{separator}\n[LLM RESPONSE (JSON)]\n{separator}")
-                print(content)
-                print(f"{separator}\n[END RESPONSE]\n{separator}")
-
-            if not content or not content.strip():
-                if debug:
-                    print(f"[LLM] Empty content received, trying next payload variant")
-                # Try next payload variant instead of failing immediately
-                continue
-
-            return _parse_response(content)
-
-    raise RuntimeError(f"LLM request failed after trying all payload variants. Last error: {last_error_text[:200] if last_error_text else 'empty content or unknown error'}")
+        return _parse_response(content)
 
 
 def _extract_domain(url: str) -> str:
@@ -1511,6 +1481,8 @@ def _validate_decision(decision: Dict[str, str], name: str, institution: str) ->
         return False
     if verdict == "connected" and relationship_type == "None":
         return False
+    # Alumni and Attended are valid connection types for "connected" verdict
+    # Other types (Executive, Faculty, etc.) are also valid
     if verdict != "connected" and relationship_type not in {"None", "Other"}:
         return False
     if legacy_type and legacy_type not in [
@@ -1700,7 +1672,7 @@ async def analyze_connection(
     *,
     debug: bool = False,
     max_retries: int = 3,
-    per_attempt_timeout: float = 90.0,  # Increased to 90s for better reliability
+    per_attempt_timeout: float = 30.0,  # Reduced to 30s for faster failure detection (allows 3 retries within 180s)
 ) -> Dict[str, str]:
     """Analyze connection with retries and per-attempt timeout.
     
@@ -1710,7 +1682,7 @@ async def analyze_connection(
         results: Search results
         debug: Enable debug output
         max_retries: Maximum retry attempts (default 3)
-        per_attempt_timeout: Maximum seconds per LLM API call (default 90s)
+        per_attempt_timeout: Maximum seconds per LLM API call (default 30s, increases with exponential backoff)
     """
     name = _safe_text(name)
     institution = _safe_text(institution)
@@ -1732,9 +1704,9 @@ async def analyze_connection(
             # Add per-attempt timeout with exponential backoff
             timeout = per_attempt_timeout * (1.5 ** (attempt - 1))  # Increase timeout on retries
             try:
-                # Use temperature 0.2 for better consistency while allowing some flexibility
+                # Use temperature 0 for fully deterministic outputs
                 parsed = await asyncio.wait_for(
-                    _call_llm(prompt, debug=debug, temperature=0.2),
+                    _call_llm(prompt, debug=debug),
                     timeout=timeout
                 )
             except asyncio.TimeoutError:

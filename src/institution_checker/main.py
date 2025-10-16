@@ -8,33 +8,16 @@ import pandas as pd
 
 from .config import INSTITUTION
 from .llm_processor import analyze_connection, close_session, refresh_session
-from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources
+from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources, _fix_text_encoding
 
-# Import the text fixing utility
-try:
-    import ftfy
-    FTFY_AVAILABLE = True
-except ImportError:
-    FTFY_AVAILABLE = False
-
-
-def _fix_text_encoding(text: str) -> str:
-    """Fix mojibake and encoding errors in text using ftfy."""
-    if not text or not FTFY_AVAILABLE:
-        return text
-    try:
-        return ftfy.fix_text(text)
-    except Exception:
-        return text
-
-DEFAULT_BATCH_SIZE = 5
+DEFAULT_BATCH_SIZE = 6
 DEFAULT_INPUT_PATH = "data/input_names.csv"
 RESULTS_PATH = "data/results.csv"
 PARTIAL_RESULTS_PATH = "data/results_partial.csv"
 INTER_BATCH_DELAY = 3  # seconds between batches to prevent rate limiting
-NAME_TIMEOUT = 60.0  # maximum time allowed per name before failing (reduced from 240s to prevent runaway searches)
-SEARCH_TIMEOUT = 45.0  # maximum time for search phase per name (should complete well before NAME_TIMEOUT)
-MAX_CONCURRENT_LLM_CALLS = 5  # limit concurrent LLM API calls to avoid overwhelming the API
+NAME_TIMEOUT = 180.0  # maximum time allowed per name (gives buffer for LLM retries: 30s * 1.5^2 * 3 = ~150s)
+SEARCH_TIMEOUT = 60.0  # maximum time for search phase per name (should complete well before NAME_TIMEOUT)
+MAX_CONCURRENT_LLM_CALLS = 2  # limit concurrent LLM API calls (reduced to 2 to reduce SSL timeouts)
 
 
 class NameProcessingTimeout(Exception):
@@ -139,6 +122,11 @@ async def process_name_llm(name: str, results: List[Dict[str, Any]], debug: bool
     
     try:
         decision = await analyze_connection(name, INSTITUTION, results, debug=debug)
+        
+        # Defensive check: ensure decision is not None
+        if decision is None:
+            raise RuntimeError("analyze_connection returned None")
+        
         llm_elapsed = time.time() - llm_start
         print(f"[PROGRESS] LLM analysis completed for {name} in {llm_elapsed:.1f}s")
         
@@ -158,62 +146,19 @@ async def process_name(name: str, use_enhanced_search: bool, debug: bool = False
     This is kept for backward compatibility and simple single-name processing.
     For batch processing, use the split phase approach in process_batch().
     """
-    search_start = time.time()
-    
-    print(f"[PROGRESS] Starting search for: {name}")
+    start = time.time()
     
     try:
-        # Step 1: Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
-        if use_enhanced_search:
-            # Try basic search first (faster, less redundant)
-            query = f'"{name}" "{INSTITUTION}"'
-            print(f"[PROGRESS] Trying basic search first for efficiency...")
-            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
-            
-            # Evaluate if we need enhanced search
-            # Check for high-quality results with strong signals
-            high_quality_count = sum(
-                1 for r in results 
-                if r.get('signals', {}).get('relevance_score', 0) >= 10
-            )
-            
-            # Escalate to enhanced search if:
-            # - Less than 8 total results, OR
-            # - Less than 3 high-quality results (to ensure thorough checking)
-            needs_enhanced = len(results) < 8 or high_quality_count < 3
-            
-            if needs_enhanced:
-                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
-                results = await enhanced_search(name, INSTITUTION, num_results=30, debug=debug)
-            else:
-                print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
-            
-            # Final fallback if still no results
-            if not results:
-                print(f"[WARN] No results from either search method")
-        else:
-            query = f'"{name}" {INSTITUTION}'
-            results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
-        
-        search_elapsed = time.time() - search_start
-        print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
-        
-        if not results:
-            print(f"[WARN] No search results found for {name}")
-        
-        # Step 2: LLM Analysis
-        llm_start = time.time()
-        print(f"[PROGRESS] Starting LLM analysis for: {name}")
-        decision = await analyze_connection(name, INSTITUTION, results, debug=debug)
-        llm_elapsed = time.time() - llm_start
-        print(f"[PROGRESS] LLM analysis completed for {name} in {llm_elapsed:.1f}s")
+        # Use the split-phase approach for consistency
+        result_name, results = await process_name_search(name, use_enhanced_search, debug=debug)
+        decision = await process_name_llm(result_name, results, debug=debug)
         
         payload = {"name": name, "institution": INSTITUTION}
         payload.update(decision)
         return payload
         
     except Exception as e:
-        elapsed = time.time() - search_start
+        elapsed = time.time() - start
         print(f"[ERROR] Failed to process {name} after {elapsed:.1f}s: {e}")
         raise
 
@@ -414,6 +359,10 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
             else:
                 print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: {llm_outcome}")
                 result = build_error_result(name, llm_outcome)
+        elif llm_outcome is None:
+            # Handle case where LLM returned None (should not happen, but defensive check)
+            print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: LLM returned None")
+            result = build_error_result(name, RuntimeError("LLM returned None"))
         else:
             print(f"[BATCH] Completed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
             result = llm_outcome

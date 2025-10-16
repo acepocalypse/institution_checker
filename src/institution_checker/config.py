@@ -34,11 +34,57 @@ def get_api_key():
         return env_key
     raise ValueError("LLM API key not set. Use set_api_key() or set LLM_API_KEY environment variable.")
 
-MODEL_NAME = "gpt-oss:latest"
+MODEL_NAME = "phi4:latest"
 
 # Puppeteer options
 BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-blink-features=AutomationControlled"
+]
+
+# Shared temporal analysis terms (used across search and llm_processor modules)
+CURRENT_TERMS = [
+    "currently",
+    "current",
+    "now",
+    "presently",
+    "serving as",
+    "now at",
+    "active",
+    "as of",
+    "is a",
+    "is an",
+    "works at",
+    "working at",
+    "employed",
+]
+
+PAST_TERMS = [
+    "former",
+    "previous",
+    "previously",
+    "retired",
+    "emeritus",
+    "alumni",
+    "alumnus",
+    "alumna",
+    "alum",
+    "alumnae",
+    "graduate",
+    "graduated",
+    "school of",
+    "college of",
+    "was at",
+    "was a",
+    "worked at",
+    "served as",
+    "left",
+    "departed",
+    "ex-",
+    "until",
+    "passed away",
+    "died",
+    "late",
+    "deceased",
 ]
