@@ -1075,6 +1075,10 @@ def _parse_result_element(
     snippet = _build_extended_snippet(element)
     signals = _compute_signals(title, snippet, url, institution, person_name)
     signals = _ensure_person_signal(signals, url, institution, person_name)
+    
+    # Return the result - don't filter out "weak" results
+    # Let the LLM decide if they're relevant. Even results with no name/institution match
+    # might contain relevant information when combined with the query context.
     return {
         "title": title,
         "url": url,
@@ -1164,7 +1168,9 @@ async def bing_search(
 ) -> List[Dict[str, object]]:
     query = _ensure_name_and_institution(query, person_name, institution)
     target = max(num_results, 10)
-    fetch_count = min(target * 2, 50)
+    # Fetch more results from HTML to account for filtering/deduplication
+    # Request 3x to ensure we get enough after extraction (was 2x)
+    fetch_count = min(target * 3, 100)
     html = await _fetch_with_browser(query, count=fetch_count, debug=debug)
     if not html:
         if debug:
@@ -1175,7 +1181,7 @@ async def bing_search(
     results = _extract_results(
         html,
         institution=institution,
-        limit=num_results * 2,
+        limit=num_results * 3,  # Extract more to account for filtering
         person_name=person_name,
         debug=debug,
     )

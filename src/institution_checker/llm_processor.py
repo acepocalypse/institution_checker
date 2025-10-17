@@ -49,6 +49,12 @@ Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote th
 
 Use "current" when the language is present tense or references this year/{prior_year}; otherwise choose "past". Pick "unknown" when the timeframe cannot be inferred.
 
+CORRECTION RULES (apply if evidence matches):
+- If mentions "professor", "faculty", or "PhD from" → set connected=Y, type=Faculty or Alumni
+- If mentions "honorary", "lecture", "speaker", "award", "parents" → set connected=N
+- If mentions "Processing error" → mark verification_status=needs_review
+- If only LinkedIn/blog source → mark verification_status=needs_review
+
 Return JSON only (no markdown) using this schema:
 {{
     "verdict": "connected|not_connected|uncertain",

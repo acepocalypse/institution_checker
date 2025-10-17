@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from tqdm.auto import tqdm  # Auto-detects Jupyter notebooks vs terminal
 
 from .config import INSTITUTION
 from .llm_processor import analyze_connection, close_session, refresh_session, _build_error
@@ -14,7 +15,7 @@ DEFAULT_BATCH_SIZE = 6
 DEFAULT_INPUT_PATH = "data/input_names.csv"
 RESULTS_PATH = "data/results.csv"
 PARTIAL_RESULTS_PATH = "data/results_partial.csv"
-INTER_BATCH_DELAY = 3  # seconds between batches to prevent rate limiting
+INTER_BATCH_DELAY = 2  # seconds between batches to prevent rate limiting
 NAME_TIMEOUT = 180.0  # maximum time allowed per name (gives buffer for LLM retries: 30s * 1.5^2 * 3 = ~150s)
 SEARCH_TIMEOUT = 60.0  # maximum time for search phase per name (should complete well before NAME_TIMEOUT)
 MAX_CONCURRENT_LLM_CALLS = 2  # limit concurrent LLM API calls (reduced to 2 to reduce SSL timeouts)
@@ -63,35 +64,25 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
         try:
             # Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
             if use_enhanced_search:
-                # Try basic search first (faster, less redundant)
-                query = f'"{name}" "{INSTITUTION}"'
-                print(f"[PROGRESS] Trying basic search first for efficiency...")
-                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
+                # Try basic search first - use flexible query without over-quoting
+                # Request 20 results so after filtering/extraction we get ~15 for LLM
+                query = f'{name} "{INSTITUTION}"'
+                print(f"[PROGRESS] Name: '{name}' | Query: '{query}'")
+                results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=20, debug=debug)
                 
-                # Evaluate if we need enhanced search
-                # Check for high-quality results with strong signals
-                high_quality_count = sum(
-                    1 for r in results 
-                    if r.get('signals', {}).get('relevance_score', 0) >= 10
-                )
+                # If we got results, show what they are
+                if results:
+                    print(f"[PROGRESS] Result sample: {results[0]['title'][:80] if results[0].get('title') else 'N/A'}")
                 
-                # STRICT escalation to enhanced search only for genuinely ambiguous cases:
-                # - Less than 2 total results (extremely sparse), AND
-                # - Zero high-quality results (no strong evidence)
-                # This prevents ~600 Purdue names from escalating while still catching edge cases.
-                needs_enhanced = len(results) < 2 and high_quality_count == 0
-                
-                if needs_enhanced:
-                    print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search...")
+                # If basic search returns very few results, escalate to enhanced
+                # Enhanced search tries multiple query strategies to catch real connections
+                if len(results) < 5:
+                    print(f"[PROGRESS] Basic search returned only {len(results)} results, escalating to enhanced search...")
                     results = await enhanced_search(name, INSTITUTION, num_results=30, debug=debug)
                 else:
-                    print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
-                
-                # Final fallback if still no results
-                if not results:
-                    print(f"[WARN] No results from either search method")
+                    print(f"[PROGRESS] Basic search returned {len(results)} results, sufficient for analysis")
             else:
-                query = f'"{name}" {INSTITUTION}'
+                query = f'{name} {INSTITUTION}'
                 results = await bing_search(query, institution=INSTITUTION, person_name=name, num_results=25, debug=debug)
             
             search_elapsed = time.time() - search_start
@@ -210,17 +201,12 @@ def _build_immediate_not_connected(name: str, institution: str, reason: str) -> 
 
 
 def should_skip_llm(results: List[Dict[str, Any]]) -> tuple[bool, Optional[str]]:
-    """Check if we can skip LLM call for obvious cases.
+    """Check if we can skip LLM call.
     
     Returns: (should_skip: bool, reason: str)
     
-    Skip LLM ONLY when:
-    - Zero search results found (no evidence to analyze at all)
-    
-    Important: We do NOT skip based on score thresholds because:
-    - Low scores might still contain valid connections (name collisions, mixed results)
-    - The LLM is good at finding connections even in weak result sets
-    - False negatives are worse than wasted LLM calls for 99.4% non-Purdue cases
+    Simple rule: Skip ONLY if we have zero results.
+    Otherwise, always call LLM - it's the expert at analyzing connections.
     """
     if not results:
         return True, "No search results found"
@@ -467,7 +453,7 @@ async def run_pipeline(names: List[str], batch_size: int, use_enhanced_search: b
     all_results: List[Dict[str, str]] = []
     start_time = time.time()
 
-    for index, batch in enumerate(batches, 1):
+    for index, batch in enumerate(tqdm(batches, desc="Processing batches", unit="batch"), 1):
         print(f"\n[PIPELINE] ===== BATCH {index}/{len(batches)} =====")
         print(f"[PIPELINE] Names in this batch: {batch}")
         batch_start = time.time()
@@ -526,7 +512,7 @@ async def run_pipeline(names: List[str], batch_size: int, use_enhanced_search: b
             retry_batches = [failed_names[i:i + retry_batch_size] for i in range(0, len(failed_names), retry_batch_size)]
             
             retry_results: List[Dict[str, str]] = []
-            for retry_index, retry_batch in enumerate(retry_batches, 1):
+            for retry_index, retry_batch in enumerate(tqdm(retry_batches, desc="Retrying failed batches", unit="batch"), 1):
                 print(f"[RETRY] Processing batch {retry_index}/{len(retry_batches)}: {retry_batch}")
                 retry_batch_results = await process_batch(retry_batch, use_enhanced_search, debug=debug)
                 retry_results.extend(retry_batch_results)
