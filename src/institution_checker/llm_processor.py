@@ -11,7 +11,8 @@ from urllib.parse import urlparse
 import aiohttp
 import unicodedata
 
-from .config import get_api_key, LLM_API_URL, MODEL_NAME, CURRENT_TERMS, PAST_TERMS
+from .config import get_api_key, LLM_API_URL, MODEL_NAME, CURRENT_TERMS, PAST_TERMS, is_thinking_model, _contains_any
+from .search import _institution_tokens
 
 _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
@@ -23,25 +24,37 @@ MAX_RESULTS_FOR_PROMPT = 15 # Reduced from 18 for faster, more consistent respon
 # STRICT EVIDENCE-BASED PROMPT - Balanced for speed and accuracy
 PROMPT_TEMPLATE = """You are an evidence-driven verifier confirming whether {name} has a past or present relationship with {institution}. Read all {max_results} search findings below and decide if there is a real connection.
 
-CONNECTED: Return verdict="connected" when the evidence shows:
-1. Alumni: Earned degree (Bachelor, Master, PhD, etc.)
-2. Attended: Enrolled/studied without earning a degree
-3. Executive/Faculty/Staff: Formal institutional employment or leadership role
-4. Postdoc: Postdoctoral position
-5. Visiting: Visiting scholar, visiting professor, or similar temporary academic role
+CONNECTED: Return verdict="connected" ONLY when the evidence explicitly and directly shows:
+1. Alumni: Earned degree (Bachelor, Master, PhD, etc.) from the institution
+2. Attended: Enrolled/studied as a student without earning a degree
+3. Faculty: Teaching position, professor, instructor, lecturer role
+4. Staff: Administrative or research staff position
+5. Executive: President, dean, director, provost, chancellor role
+6. Postdoc: Postdoctoral fellowship position
+7. Visiting: Visiting scholar, visiting professor, or visiting fellow role
 
-NOT_CONNECTED: Return verdict="not_connected" only for honorary awards, invited talks, external boards, publications, joint campuses (unless policy allows), or vague associations with no institutional relationship.
+STRICT EXCLUSIONS - These do NOT count as connections:
+- Publications where a symposium/conference was held AT the institution (e.g., "Proceedings of the SIGPLAN Symposium...Purdue University" in a citation)
+- Honorary degrees or awards
+- Invited talks, seminars, or guest lectures
+- External advisory boards or consulting roles
+- Co-authorship or joint research with someone at the institution
+- Temporary event participation
+- Publications citing or mentioning the institution
+- Joint or affiliate campus mentions (e.g., IUPUI, IUPFW)
 
-Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the evidence that supports your verdict.
+The person must have had a direct, institutional role or status (student, employee, degree-holder) at the institution. Brief mentions or publications held at a venue are NOT connections.
+
+Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the EXACT evidence that directly supports a connection.
 
 Use "current" when the language is present tense or references this year/{prior_year}; otherwise choose "past". Pick "unknown" when the timeframe cannot be inferred.
 
 Return JSON only (no markdown) using this schema:
 {{
     "verdict": "connected|not_connected|uncertain",
-    "relationship_type": "Alumni|Attended|Executive|Faculty|Postdoc|Staff|Visiting|Other|None",
+    "relationship_type": "Alumni|Attended|Faculty|Staff|Executive|Postdoc|Visiting|Other|None",
     "relationship_timeframe": "current|past|unknown",
-    "verification_detail": "Quote the decisive sentence or state why the connection fails",
+    "verification_detail": "Quote the EXACT evidence or state why the connection fails",
     "summary": "One concise sentence describing the relationship decision",
     "primary_source": "Best supporting URL (prefer .edu)",
     "confidence": "high|medium|low",
@@ -133,6 +146,62 @@ _ATTENDED_TERMS = {
     "went to",
 }
 _HONORARY_TERMS = ["honorary", "honoris causa"]
+
+
+def _extract_response_content(message: Dict[str, Any], debug: bool = False) -> tuple[Optional[str], Optional[str]]:
+    """Extract content and reasoning from an LLM response message.
+    
+    Handles both thinking models (with reasoning tokens) and non-thinking models.
+    
+    Returns:
+        Tuple of (content, reasoning)
+        - content: The final JSON output or answer
+        - reasoning: The thinking/reasoning text (if present), None otherwise
+    """
+    reasoning = message.get("reasoning", "")
+    content = message.get("content", "")
+    
+    if debug:
+        print(f"[LLM PARSE] Message keys: {list(message.keys())}")
+        if reasoning:
+            print(f"[LLM PARSE] Detected reasoning tokens (length: {len(reasoning)})")
+    
+    # If we have reasoning but content is empty or doesn't look like final output,
+    # try to extract JSON from the reasoning
+    content_stripped = content.strip() if content else ""
+    
+    # Check if content looks like it might be part of thinking tokens rather than final output
+    if reasoning and (not content_stripped or not content_stripped.startswith("{")):
+        if debug:
+            print(f"[LLM PARSE] Content missing or doesn't start with JSON. Searching in reasoning...")
+        
+        # Try to find a JSON object in the reasoning text
+        # Look for the final JSON block (it might contain thinking before it)
+        json_matches = list(re.finditer(r'\{[^{}]*"verdict"[^{}]*\}', reasoning, re.DOTALL))
+        
+        if json_matches:
+            # Take the last match (which is likely the final response)
+            final_match = json_matches[-1]
+            extracted_json = final_match.group(0)
+            
+            if debug:
+                print(f"[LLM PARSE] Extracted JSON from reasoning: {extracted_json[:100]}...")
+            
+            return extracted_json, reasoning
+        else:
+            if debug:
+                print(f"[LLM PARSE] No valid JSON object found in reasoning")
+    
+    # Normal case: return content as-is (either from non-thinking model or thinking model's final output)
+    return content, reasoning if reasoning else None
+
+
+def _should_extract_thinking(debug: bool = False) -> bool:
+    """Check if the current model is a thinking model and we should look for reasoning tokens."""
+    should = is_thinking_model(MODEL_NAME)
+    if debug:
+        print(f"[LLM CONFIG] Model '{MODEL_NAME}' is thinking model: {should}")
+    return should
 
 
 async def get_session() -> aiohttp.ClientSession:
@@ -915,7 +984,14 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
             if debug:
                 print("[LLM] Failed to parse server response as JSON")
             raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
-
+        
+        # Defensive check: ensure data is a dict (not a list or other type)
+        if not isinstance(data, dict):
+            if debug:
+                print(f"[LLM] ERROR: Response is not a dict, it's a {type(data).__name__}")
+                print(f"[LLM] Response content: {str(data)[:200]}")
+            raise RuntimeError(f"LLM response is not a JSON object: got {type(data).__name__}")
+        
         # Debug: Print full API response structure
         if debug:
             print(f"[LLM DEBUG] Full API response keys: {list(data.keys())}")
@@ -934,38 +1010,22 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
             print(f"[LLM DEBUG] Message keys: {list(message.keys())}")
             print(f"[LLM DEBUG] Full message structure: {json.dumps(message, indent=2)}")
         
-        # For reasoning models, check if there's separate reasoning and content
-        reasoning = message.get("reasoning", "")
-        content = message.get("content", "")
-        
-        # If content looks like reasoning (doesn't start with {), try to extract JSON from it
-        content_stripped = content.strip()
-        if content_stripped and not content_stripped.startswith("{"):
-            if debug:
-                print("[LLM DEBUG] Content doesn't start with {, appears to be reasoning text")
-            # Try to find JSON object within the reasoning text
-            json_match = re.search(r'\{[^{}]*"verdict"[^{}]*\}', content, re.DOTALL)
-            if json_match:
-                extracted_json = json_match.group(0)
-                if debug:
-                    print(f"[LLM DEBUG] Extracted JSON from reasoning: {extracted_json}")
-                content = extracted_json
-            else:
-                if debug:
-                    print("[LLM DEBUG] No JSON object found in reasoning text, will attempt to construct from reasoning")
+        # ✅ NEW: Extract content from both thinking and non-thinking models
+        content, reasoning = _extract_response_content(message, debug=debug)
+        content_stripped = content.strip() if content else ""
         
         if debug:
             if reasoning:
                 print(f"[LLM] Reasoning length: {len(reasoning)} chars")
                 print(f"[LLM] Reasoning preview: {reasoning[:300]}...")
-            print(f"[LLM] Content length: {len(content)} chars")
-            if len(content) < 500:
-                print(f"[LLM] Full content: {content}")
+            print(f"[LLM] Content length: {len(content_stripped)} chars")
+            if len(content_stripped) < 500:
+                print(f"[LLM] Full content: {content_stripped}")
             else:
-                print(f"[LLM] Content preview: {content[:300]}...")
-            if not content.strip().endswith("}"):
-                print("[LLM] ??  WARNING: Response doesn't end with }, likely TRUNCATED")
-                print(f"[LLM] Last 200 chars: ...{content[-200:]}")
+                print(f"[LLM] Content preview: {content_stripped[:300]}...")
+            if not content_stripped.endswith("}"):
+                print("[LLM] ⚠️  WARNING: Response doesn't end with }, likely TRUNCATED")
+                print(f"[LLM] Last 200 chars: ...{content_stripped[-200:]}")
 
         if debug or _PROMPT_LOGGING_ENABLED:
             separator = "=" * 48
@@ -974,15 +1034,15 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
                 print(reasoning)
                 print(f"{separator}\n[END REASONING]\n{separator}")
             print(f"{separator}\n[LLM RESPONSE (JSON)]\n{separator}")
-            print(content)
+            print(content_stripped)
             print(f"{separator}\n[END RESPONSE]\n{separator}")
 
-        if not content or not content.strip():
+        if not content_stripped:
             if debug:
                 print(f"[LLM] Empty content received from API")
             raise RuntimeError("LLM returned empty content")
 
-        return _parse_response(content)
+        return _parse_response(content_stripped)
 
 
 def _extract_domain(url: str) -> str:
@@ -995,24 +1055,6 @@ def _extract_domain(url: str) -> str:
         return netloc
     except Exception:
         return ""
-
-
-def _contains_any(text: str, terms: Iterable[str]) -> bool:
-    return any(term in text for term in terms)
-
-
-def _institution_tokens(institution: str) -> List[str]:
-    trimmed = (institution or "").strip().lower()
-    if not trimmed:
-        return []
-    tokens = {trimmed}
-    tokens.update([part for part in re.split(r"\s+", trimmed) if part])
-    short = trimmed.replace("university", "").replace("college", "").strip()
-    if short:
-        tokens.add(short)
-    tokens.discard("university")
-    tokens.discard("college")
-    return [token for token in tokens if token]
 
 def _extract_years(text: str) -> List[int]:
     """Extract all year mentions from text."""

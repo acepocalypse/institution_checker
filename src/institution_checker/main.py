@@ -2,12 +2,12 @@ import asyncio
 import os
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from .config import INSTITUTION
-from .llm_processor import analyze_connection, close_session, refresh_session
+from .llm_processor import analyze_connection, close_session, refresh_session, _build_error
 from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources, _fix_text_encoding
 
 DEFAULT_BATCH_SIZE = 6
@@ -75,13 +75,14 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
                     if r.get('signals', {}).get('relevance_score', 0) >= 10
                 )
                 
-                # Escalate to enhanced search if:
-                # - Less than 8 total results, OR
-                # - Less than 3 high-quality results (to ensure thorough checking)
-                needs_enhanced = len(results) < 8 or high_quality_count < 3
+                # STRICT escalation to enhanced search only for genuinely ambiguous cases:
+                # - Less than 2 total results (extremely sparse), AND
+                # - Zero high-quality results (no strong evidence)
+                # This prevents ~600 Purdue names from escalating while still catching edge cases.
+                needs_enhanced = len(results) < 2 and high_quality_count == 0
                 
                 if needs_enhanced:
-                    print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search for thorough verification...")
+                    print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), escalating to enhanced search...")
                     results = await enhanced_search(name, INSTITUTION, num_results=30, debug=debug)
                 else:
                     print(f"[PROGRESS] Basic search returned {len(results)} results ({high_quality_count} high-quality), sufficient for analysis")
@@ -182,6 +183,51 @@ async def _process_name_with_timeout(name: str, use_enhanced_search: bool, debug
         raise NameProcessingTimeout(name, NAME_TIMEOUT) from exc
 
 
+def _build_immediate_not_connected(name: str, institution: str, reason: str) -> Dict[str, str]:
+    """Build an immediate 'not_connected' result without LLM call.
+    
+    Used for obvious cases where we can skip LLM to save API quota.
+    """
+    return {
+        "name": name,
+        "institution": institution,
+        "verdict": "not_connected",
+        "connected": "N",
+        "relationship_type": "None",
+        "relationship_timeframe": "unknown",
+        "verification_detail": reason,
+        "summary": reason,
+        "primary_source": "",
+        "confidence": "low",
+        "verification_status": "needs_review",
+        "temporal_context": "N/A",
+        "connection_type": "None",
+        "connection_detail": reason,
+        "current_or_past": "N/A",
+        "supporting_url": "",
+        "temporal_evidence": "N/A",
+    }
+
+
+def should_skip_llm(results: List[Dict[str, Any]]) -> tuple[bool, Optional[str]]:
+    """Check if we can skip LLM call for obvious cases.
+    
+    Returns: (should_skip: bool, reason: str)
+    
+    Skip LLM ONLY when:
+    - Zero search results found (no evidence to analyze at all)
+    
+    Important: We do NOT skip based on score thresholds because:
+    - Low scores might still contain valid connections (name collisions, mixed results)
+    - The LLM is good at finding connections even in weak result sets
+    - False negatives are worse than wasted LLM calls for 99.4% non-Purdue cases
+    """
+    if not results:
+        return True, "No search results found"
+    
+    return False, None
+
+
 def print_result_summary(result: Dict[str, str]) -> None:
     name = result.get("name", "")
     verdict = result.get("verdict", "uncertain")
@@ -197,30 +243,6 @@ def print_result_summary(result: Dict[str, str]) -> None:
         print(f"[--] {name}: no verified connection ({confidence}, {verification_status}) - {summary}")
     else:
         print(f"[??] {name}: inconclusive ({confidence}, {verification_status}) - {summary}")
-
-
-def build_error_result(name: str, error: Exception) -> Dict[str, str]:
-    message = str(error)
-    return {
-        "name": name,
-        "institution": INSTITUTION,
-        "verdict": "not_connected",
-        "connected": "N",
-        "relationship_type": "None",
-        "relationship_timeframe": "unknown",
-        "verification_detail": f"Error: {message}",
-        "summary": f"Processing error: {message}",
-        "primary_source": "",
-        "confidence": "low",
-        "verification_status": "needs_review",
-        "temporal_context": f"Processing error: {message}",
-        # Legacy aliases for backward compatibility
-        "connection_type": "Others",
-        "connection_detail": f"Error: {message}",
-        "current_or_past": "N/A",
-        "supporting_url": "",
-        "temporal_evidence": f"Processing error: {message}",
-    }
 
 
 def has_error(result: Dict[str, str]) -> bool:
@@ -313,9 +335,29 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
             search_results[result_name] = results
             print(f"[BATCH] Search succeeded for {name}: {len(results)} results")
     
-    # ===== PHASE 2: LLM Analysis (all in parallel with concurrency limit) =====
-    print(f"[BATCH] Phase 2: Running LLM analysis in parallel for all {len(names)} names (max {MAX_CONCURRENT_LLM_CALLS} concurrent)")
+    # ===== PHASE 2: LLM Analysis (with early termination for obvious cases) =====
+    print(f"[BATCH] Phase 2: Evaluating search results and running LLM analysis in parallel for all {len(names)} names (max {MAX_CONCURRENT_LLM_CALLS} concurrent)")
     llm_phase_start = time.time()
+    
+    # First pass: identify which names need LLM vs which can skip it
+    names_needing_llm: List[str] = []
+    skipped_results: Dict[str, Dict[str, str]] = {}
+    skipped_count = 0
+    
+    for name in names:
+        results = search_results.get(name, [])
+        should_skip, skip_reason = should_skip_llm(results)
+        
+        if should_skip:
+            skipped_result = _build_immediate_not_connected(name, INSTITUTION, skip_reason or "No results found")
+            skipped_results[name] = skipped_result
+            skipped_count += 1
+            print(f"[BATCH] Skipping LLM for {name}: {skip_reason}")
+        else:
+            names_needing_llm.append(name)
+    
+    if skipped_count > 0:
+        print(f"[BATCH] Skipped LLM for {skipped_count} name(s) with obvious non-connections, {len(names_needing_llm)} names need LLM")
     
     # Create semaphore to limit concurrent LLM calls
     llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
@@ -329,18 +371,31 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
     
     llm_coroutines = [
         llm_with_semaphore(name, search_results.get(name, []))
-        for name in names
+        for name in names_needing_llm
     ]
     llm_outcomes = await asyncio.gather(*llm_coroutines, return_exceptions=True)
     
     llm_phase_elapsed = time.time() - llm_phase_start
-    print(f"[BATCH] Phase 2 completed in {llm_phase_elapsed:.1f}s")
+    print(f"[BATCH] Phase 2 completed in {llm_phase_elapsed:.1f}s ({len(names_needing_llm)} LLM calls, {skipped_count} skipped)")
     
     # ===== Combine results =====
     ordered_results: List[Dict[str, str]] = []
     completed_count = 0
     
-    for name, llm_outcome in zip(names, llm_outcomes):
+    # First add skipped results (they're already complete)
+    for name in names:
+        if name in skipped_results:
+            ordered_results.append(skipped_results[name])
+            completed_count += 1
+    
+    # Then add LLM results in order
+    llm_outcome_map: Dict[str, Any] = dict(zip(names_needing_llm, llm_outcomes))
+    
+    for name in names:
+        if name in skipped_results:
+            continue  # Already added above
+        
+        llm_outcome = llm_outcome_map.get(name)
         completed_count += 1
         elapsed = time.time() - batch_start
         
@@ -351,18 +406,30 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
                 print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) - search timeout after {elapsed:.1f}s")
             else:
                 print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) - search error")
-            result = build_error_result(name, error)
+            error_result = _build_error(str(error))
+            error_result["name"] = name
+            error_result["institution"] = INSTITUTION
+            result = error_result
+        elif llm_outcome is None:
+            # This shouldn't happen (should_skip_llm or LLM should provide result), but defensive check
+            print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) - unexpected None outcome")
+            error_result = _build_error("Unexpected None outcome from LLM phase")
+            error_result["name"] = name
+            error_result["institution"] = INSTITUTION
+            result = error_result
         elif isinstance(llm_outcome, Exception):
             if isinstance(llm_outcome, asyncio.TimeoutError):
                 print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) - LLM timeout after {elapsed:.1f}s")
-                result = build_error_result(name, NameProcessingTimeout(name, NAME_TIMEOUT))
+                error_result = _build_error(str(NameProcessingTimeout(name, NAME_TIMEOUT)))
+                error_result["name"] = name
+                error_result["institution"] = INSTITUTION
+                result = error_result
             else:
                 print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: {llm_outcome}")
-                result = build_error_result(name, llm_outcome)
-        elif llm_outcome is None:
-            # Handle case where LLM returned None (should not happen, but defensive check)
-            print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: LLM returned None")
-            result = build_error_result(name, RuntimeError("LLM returned None"))
+                error_result = _build_error(str(llm_outcome))
+                error_result["name"] = name
+                error_result["institution"] = INSTITUTION
+                result = error_result
         else:
             print(f"[BATCH] Completed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
             result = llm_outcome

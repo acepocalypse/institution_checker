@@ -344,6 +344,28 @@ The output columns are designed for automated evaluation:
 
 If you need to add evaluation columns (e.g., `all correct`, `connection correct`, `type correct`, `temporal correct`), you can merge the output with your ground truth data using pandas or Excel.
 
+## Code Quality & Refactoring
+
+### Duplicate Code Analysis
+
+A comprehensive analysis has been completed identifying opportunities to remove duplicate code (~150-200 lines, ~5% of codebase) without affecting functionality.
+
+**Documentation available in the project root:**
+- `ANALYSIS_SUMMARY.md` - Executive overview and recommendations
+- `DUPLICATE_CODE_ANALYSIS.md` - Detailed analysis with code examples
+- `QUICK_REFERENCE.md` - Exact duplicate locations with line numbers
+- `IMPLEMENTATION_GUIDE.md` - Step-by-step refactoring instructions
+- `VISUAL_MAP.md` - Architecture and dependency diagrams
+
+**Key findings:**
+- 3 high-priority duplicates (error building, utility functions)
+- 2 medium-priority consolidation opportunities (text normalization, institution helpers)
+- Phase 1 refactoring: 10 minutes → removes 25 LOC
+- Full refactoring: 45-60 minutes → removes 175 LOC
+- Risk level: Low (all changes isolated, full rollback plan included)
+
+Start with `ANALYSIS_SUMMARY.md` for a quick decision on whether to refactor.
+
 ## Contributing
 
 Please file issues or pull requests for problems or improvements.

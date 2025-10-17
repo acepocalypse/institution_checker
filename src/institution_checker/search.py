@@ -17,7 +17,7 @@ try:
 except ImportError:
     FTFY_AVAILABLE = False
 
-from .config import BROWSER_ARGS, ACCEPT_JOINT_CAMPUSES, JOINT_CAMPUS_PATTERNS, CURRENT_TERMS, PAST_TERMS
+from .config import BROWSER_ARGS, ACCEPT_JOINT_CAMPUSES, JOINT_CAMPUS_PATTERNS, CURRENT_TERMS, PAST_TERMS, _contains_any
 
 try:
     from pyppeteer import launch
@@ -290,10 +290,6 @@ def _quote_clause(text: str) -> str:
     if not (cleaned.startswith('"') and cleaned.endswith('"')):
         cleaned = f'"{cleaned}"'
     return cleaned
-
-
-def _contains_any(text: str, phrases: Iterable[str]) -> bool:
-    return any(phrase in text for phrase in phrases)
 
 
 def _institution_tokens(institution: str) -> List[str]:

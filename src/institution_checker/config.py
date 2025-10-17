@@ -1,5 +1,6 @@
 # config.py
 import os
+from typing import Iterable
 
 INSTITUTION = "Purdue University"   # can be changed by user
 
@@ -34,7 +35,40 @@ def get_api_key():
         return env_key
     raise ValueError("LLM API key not set. Use set_api_key() or set LLM_API_KEY environment variable.")
 
-MODEL_NAME = "phi4:latest"
+MODEL_NAME = "gpt-oss:120b"
+
+# Model type detection
+THINKING_MODEL_KEYWORDS = [
+    "gpt-oss",
+    "o1",
+    "o3",
+    "deepseek",
+    "reasoning",
+    "think",
+]
+
+def is_thinking_model(model_name: str = None) -> bool:
+    """Detect if the model is a reasoning/thinking model based on name."""
+    if model_name is None:
+        model_name = MODEL_NAME
+    
+    model_lower = str(model_name).lower()
+    return any(keyword in model_lower for keyword in THINKING_MODEL_KEYWORDS)
+
+
+def get_model_config(model_name: str = None) -> dict:
+    """Get configuration for the model type (thinking vs non-thinking)."""
+    if model_name is None:
+        model_name = MODEL_NAME
+    
+    is_thinking = is_thinking_model(model_name)
+    
+    return {
+        "is_thinking": is_thinking,
+        "model_name": model_name,
+        "has_reasoning_tokens": is_thinking,
+        "parse_reasoning": is_thinking,
+    }
 
 # Puppeteer options
 BROWSER_ARGS = [
@@ -88,3 +122,17 @@ PAST_TERMS = [
     "late",
     "deceased",
 ]
+
+
+def _contains_any(text: str, phrases: Iterable[str]) -> bool:
+    """Check if any phrase appears in text.
+    
+    Args:
+        text: Text to search in
+        phrases: Phrases to look for
+        
+    Returns:
+        True if any phrase is found in text
+    """
+    return any(phrase in text for phrase in phrases)
+
