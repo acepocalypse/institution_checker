@@ -8,7 +8,7 @@ import pandas as pd
 from tqdm.auto import tqdm  # Auto-detects Jupyter notebooks vs terminal
 
 from .config import INSTITUTION
-from .llm_processor import analyze_connection, close_session, refresh_session, _build_error
+from .llm_processor import analyze_connection, close_session, refresh_session, _build_error, _safe_text
 from .search import bing_search, close_search_clients, enhanced_search, cleanup_batch_resources, _fix_text_encoding
 
 DEFAULT_BATCH_SIZE = 6
@@ -606,7 +606,10 @@ async def run_pipeline(names: List[str], batch_size: int, use_enhanced_search: b
             print(f"[ERROR] Batch {index} failed after {batch_elapsed:.1f}s: {e}")
             # Add error results for all names in failed batch
             for name in batch:
-                all_results.append(build_error_result(name, e))
+                error_result = _build_error(str(e))
+                error_result["name"] = name
+                error_result["institution"] = INSTITUTION
+                all_results.append(error_result)
         
         # Clean up resources between batches to prevent performance degradation
         if index < len(batches):  # Don't cleanup after the last batch
