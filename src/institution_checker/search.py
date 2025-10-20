@@ -179,7 +179,7 @@ _global_browser = None
 _browser_lock = asyncio.Lock()
 _browser_page_pool: List = []
 _browser_page_lock = asyncio.Lock()
-_BROWSER_PAGE_POOL_SIZE = 2
+_BROWSER_PAGE_POOL_SIZE = 6
 _FILTERED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
 
@@ -333,12 +333,18 @@ def _ensure_name_and_institution(query: str, person_name: str, institution: str)
     parts: List[str] = []
     lowered = query.lower()
     if person_name:
-        name_clause = _quote_clause(person_name)
-        if name_clause and name_clause.lower() not in lowered:
+        # Check if the unquoted name is already in the query (not just the quoted version)
+        normalized_name = _normalise_whitespace(person_name).lower()
+        if normalized_name and normalized_name not in lowered:
+            # Name not in query, add it with quotes to keep full name together
+            name_clause = _quote_clause(person_name)
             parts.append(name_clause)
     if institution:
-        institution_clause = _quote_clause(institution)
-        if institution_clause and institution_clause.lower() not in lowered:
+        # Check if the unquoted institution is already in the query
+        normalized_institution = _normalise_whitespace(institution).lower()
+        if normalized_institution and normalized_institution not in lowered:
+            # Institution not in query, add it with quotes
+            institution_clause = _quote_clause(institution)
             parts.append(institution_clause)
     if parts:
         query = _compose_query(*parts, query)

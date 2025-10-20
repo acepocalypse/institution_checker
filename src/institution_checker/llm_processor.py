@@ -343,21 +343,49 @@ def _result_combined_text(result: Dict[str, Any]) -> str:
 
 
 def _result_mentions_person(result: Dict[str, Any], name_tokens: List[str]) -> bool:
+    """Check if a result mentions the person, using lenient matching to avoid false negatives.
+    
+    This is used to determine if we should include a result for LLM analysis.
+    Being too strict here causes us to skip results that might contain connections,
+    leading to missed true positives.
+    
+    Strategy:
+    1. Trust explicit signals from search (has_person_name)
+    2. Use token-based matching with multiple fallbacks
+    3. Accept results with strong academic context even if name matching is uncertain
+    """
     if not name_tokens:
         return False
+    
     signals = result.get("signals") or {}
+    
+    # Trust explicit person signals from search
     if signals.get("has_person_name") or signals.get("has_person"):
         return True
+    
     text = _normalize_simple(_result_combined_text(result))
     if not text:
         return False
-    last_token = name_tokens[-1]
+    
     url_text = _normalize_simple(_safe_text(result.get("url")))
-    if len(last_token) > 2 and last_token not in text:
-        if not (url_text and last_token in url_text):
-            return False
-    first_token = name_tokens[0]
+    last_token = name_tokens[-1] if name_tokens else ""
+    first_token = name_tokens[0] if name_tokens else ""
     middle_tokens = name_tokens[1:-1]
+    
+    # Strategy 1: Check for last name (most reliable for academic contexts)
+    if len(last_token) > 2 and last_token not in text:
+        # Fallback: check URL for last name (e.g., /people/smith)
+        if not (url_text and last_token in url_text):
+            # Additional fallback: if we have strong academic + institution signals,
+            # accept it anyway (the LLM will determine if it's the right person)
+            has_strong_context = (
+                signals.get("has_institution") and
+                (signals.get("has_academic_role") or signals.get("relevance_score", 0) >= 8)
+            )
+            if not has_strong_context:
+                return False
+    
+    # Strategy 2: Check for first name or first initial
     if len(first_token) > 2 and first_token not in text:
         first_initial = first_token[0]
         initial_with_last = re.compile(
@@ -366,14 +394,34 @@ def _result_mentions_person(result: Dict[str, Any], name_tokens: List[str]) -> b
         has_initial_combo = bool(initial_with_last.search(text))
         has_middle_token = any(len(token) > 2 and token in text for token in middle_tokens)
         name_in_url = url_text and first_token in url_text
-        if not (has_initial_combo or has_middle_token or name_in_url):
+        
+        # More lenient: if we have institution + academic role + last name match,
+        # accept even without first name (could be different format, e.g., "Prof. Smith")
+        has_institution_and_role = (
+            signals.get("has_institution") and 
+            signals.get("has_academic_role") and
+            last_token in text
+        )
+        
+        if not (has_initial_combo or has_middle_token or name_in_url or has_institution_and_role):
             return False
+    
+    # Strategy 3: Handle first initial cases (e.g., "J. Smith")
     if len(first_token) == 1:
         initial_pattern = re.compile(rf"\b{re.escape(first_token)}\.?\b")
         has_initial = bool(initial_pattern.search(text))
         has_middle_token = any(len(token) > 2 and token in text for token in middle_tokens)
-        if not has_initial and not has_middle_token:
+        
+        # Accept if we have initial OR middle name OR strong context
+        has_strong_context = (
+            signals.get("has_institution") and
+            last_token in text and
+            (signals.get("has_academic_role") or url_text.endswith(".edu"))
+        )
+        
+        if not (has_initial or has_middle_token or has_strong_context):
             return False
+    
     return True
 
 
