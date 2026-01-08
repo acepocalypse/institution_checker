@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -10,6 +11,17 @@ from urllib.parse import urlparse
 
 import aiohttp
 import unicodedata
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from .config import get_api_key, LLM_API_URL, MODEL_NAME, CURRENT_TERMS, PAST_TERMS, is_thinking_model, _contains_any
 from .search import _institution_tokens
@@ -20,38 +32,42 @@ _last_refresh_time = 0.0
 _PROMPT_LOGGING_ENABLED = False
 
 MAX_RESULTS_FOR_PROMPT = 15 # Reduced from 18 for faster, more consistent responses
+VIP_RESULTS_FOR_PROMPT = 24
 
 # STRICT EVIDENCE-BASED PROMPT - Balanced for speed and accuracy
 PROMPT_TEMPLATE = """You are an evidence-driven verifier confirming whether {name} has a past or present relationship with {institution}. Read all {max_results} search findings below and decide if there is a real connection.
 
 CONNECTED: Return verdict="connected" ONLY when the evidence explicitly and directly shows:
 1. Alumni: Earned degree (Bachelor, Master, PhD, etc.) from the institution
-2. Attended: Enrolled/studied as a student without earning a degree
-3. Faculty: Teaching position, professor, instructor, lecturer role
-4. Staff: Administrative or research staff position
+2. Attended: Enrolled/studied as a student (including "studied under") without earning a degree
+3. Faculty: Teaching position, professor (including Distinguished/Emeritus), instructor, lecturer
+4. Staff: Administrative or research staff position (including Research Associate)
 5. Executive: President, dean, director, provost, chancellor role
 6. Postdoc: Postdoctoral fellowship position
 7. Visiting: Visiting scholar, visiting professor, or visiting fellow role
+8. Nobel Laureate: Affiliated with the institution (as faculty/student) at any time, or specifically for the prize-winning work
 
 STRICT EXCLUSIONS - These do NOT count as connections:
 - Publications where a symposium/conference was held AT the institution (e.g., "Proceedings of the SIGPLAN Symposium...Purdue University" in a citation)
-- Honorary degrees or awards
-- Invited talks, seminars, or guest lectures
+- Honorary degrees or awards (unless accompanied by a real role like Professor or Alumnus)
+- Invited talks, seminars, or guest lectures (e.g., "Gave the XYZ Lecture at Purdue")
 - External advisory boards or consulting roles
-- Co-authorship or joint research with someone at the institution
 - Temporary event participation
 - Publications citing or mentioning the institution
-- Joint or affiliate campus mentions (e.g., IUPUI, IUPFW)
+- Joint or affiliate campus mentions (e.g., IUPUI, IUPFW) unless the connection is explicitly to the main campus
 
 The person must have had a direct, institutional role or status (student, employee, degree-holder) at the institution. Brief mentions or publications held at a venue are NOT connections.
+
+Important: "Visiting Professor", "Visiting Scholar", and "Adjunct" roles ARE valid connections.
 
 Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the EXACT evidence that directly supports a connection.
 
 Use "current" when the language is present tense or references this year/{prior_year}; otherwise choose "past". Pick "unknown" when the timeframe cannot be inferred.
 
 CORRECTION RULES (apply if evidence matches):
-- If mentions "professor", "faculty", or "PhD from" → set connected=Y, type=Faculty or Alumni
-- If mentions "honorary", "lecture", "speaker", "award", "parents" → set connected=N
+- If mentions "Nobel Prize" AND the institution name (implying affiliation/alumni status) → set connected=Y, type=Faculty or Alumni (High Confidence)
+- If mentions "professor", "faculty", "PhD from", "Distinguished Professor" → set connected=Y
+- If mentions "honorary", "lecture", "speaker", "parents" → set connected=N
 - If mentions "Processing error" → mark verification_status=needs_review
 - If only LinkedIn/blog source → mark verification_status=needs_review
 
@@ -84,7 +100,7 @@ CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 # Add year pattern for temporal detection
 YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
 # Pattern for date ranges like "2010-2015" or "2010 - 2015"
-DATE_RANGE_PATTERN = re.compile(r'\b(\d{4})\s*[---]\s*(\d{4})\b')
+DATE_RANGE_PATTERN = re.compile(r'\b(\d{4})\s*[\-–—]\s*(\d{4})\b')
 # Pattern for "from X to Y"
 FROM_TO_PATTERN = re.compile(r'\bfrom\s+(\d{4})\s+to\s+(\d{4})\b', re.IGNORECASE)
 # Pattern for "since X" or "starting X"
@@ -281,6 +297,17 @@ def _safe_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _console_safe(text: str) -> str:
+    """Coerce text into the current console encoding without raising encoding errors."""
+    if text is None:
+        return ""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    except Exception:
+        return text.encode("ascii", errors="replace").decode("ascii", errors="replace")
 
 
 def _strip_accents(text: str) -> str:
@@ -705,6 +732,10 @@ def _normalize_decision(payload: Dict[str, Any]) -> Dict[str, str]:
     timeframe_source = payload.get("relationship_timeframe") or payload.get("current_or_past")
     relationship_timeframe = _normalize_timeframe(timeframe_source, verdict)
 
+    if verdict == "connected" and relationship_type in {"Alumni", "Attended"}:
+        if relationship_timeframe in {"current", "unknown"}:
+            relationship_timeframe = "past"
+
     verification_detail = _safe_text(
         payload.get("verification_detail") or payload.get("connection_detail")
     )
@@ -792,18 +823,60 @@ def _format_result_row(result: Dict[str, Any], index: int) -> str:
     return f"{index + 1}. {payload}"
 
 
-def _summarise_results(results: Iterable[Dict[str, Any]], limit: int = MAX_RESULTS_FOR_PROMPT) -> str:
+def _summarise_results(
+    results: Iterable[Dict[str, Any]],
+    limit: int = MAX_RESULTS_FOR_PROMPT,
+    min_relevance_score: int = 8,
+    allow_low_quality: bool = False,
+) -> str:
+    """Format search results for LLM prompt with quality filtering.
+    
+    Filters low-quality results using a configurable minimum relevance score.
+    A score around 8 indicates reasonable relevance (Name + Institution + some signal).
+    """
     rows = []
-    for idx, item in enumerate(results):
-        if idx >= limit:
+    result_count = 0
+    
+    for item in results:
+        # Skip low-quality results (ads, irrelevant content, weak mentions)
+        # Threshold lowered to 8 to capture more context
+        signals = item.get("signals", {}) or {}
+        relevance_score = signals.get("relevance_score", 0)
+        if relevance_score < min_relevance_score:
+            if not allow_low_quality:
+                continue
+            url = _safe_text(item.get("url"))
+            domain = urlparse(url).netloc.lower() if url else ""
+            has_excerpt = bool(_safe_text(item.get("page_excerpt")))
+            has_explicit = bool(signals.get("has_explicit_connection"))
+            is_edu = domain.endswith(".edu")
+            if not (has_excerpt or has_explicit or is_edu):
+                continue
+        
+        rows.append(_format_result_row(item, result_count))
+        result_count += 1
+        
+        if result_count >= limit:
             break
-        rows.append(_format_result_row(item, idx))
+    
     return "\n".join(rows) if rows else "(no search results available)"
 
 
-def _build_prompt(name: str, institution: str, results: List[Dict[str, Any]]) -> str:
+def _build_prompt(
+    name: str,
+    institution: str,
+    results: List[Dict[str, Any]],
+    vip_mode: bool = False,
+) -> str:
     now = datetime.utcnow()
-    findings = _summarise_results(results)
+    limit = VIP_RESULTS_FOR_PROMPT if vip_mode else MAX_RESULTS_FOR_PROMPT
+    min_score = 4 if vip_mode else 8
+    findings = _summarise_results(
+        results,
+        limit=limit,
+        min_relevance_score=min_score,
+        allow_low_quality=vip_mode,
+    )
     return PROMPT_TEMPLATE.format(
         current_date=now.strftime("%B %d, %Y"),
         current_year=now.year,
@@ -811,7 +884,7 @@ def _build_prompt(name: str, institution: str, results: List[Dict[str, Any]]) ->
         name=name,
         institution=institution,
         search_findings=findings,
-        max_results=min(len(results), MAX_RESULTS_FOR_PROMPT),
+        max_results=min(len(results), limit),
     )
 
 
@@ -1333,7 +1406,14 @@ def _postprocess_decision(
 
         current_year = datetime.utcnow().year
         classification = decision.get("relationship_timeframe", "unknown")
+        relationship_type_label = decision.get("relationship_type")
         supporting_url = decision.get("primary_source", "")
+
+        if relationship_type_label in {"Alumni", "Attended"} and classification == "current":
+            decision = dict(decision)
+            decision["relationship_timeframe"] = "past"
+            decision["current_or_past"] = "past"
+            classification = "past"
 
         # Locate the supporting search result (if available) for richer context
         supporting_result: Optional[Dict[str, Any]] = None
@@ -1462,7 +1542,7 @@ def _postprocess_decision(
                 return updated
 
         # Rule 2: upgrade "past" to "current" only when evidence explicitly says so
-        elif classification == "past":
+        elif classification == "past" and relationship_type_label not in {"Alumni", "Attended"}:
             upgrade_reasons: List[str] = []
 
             if has_current_language or mentions_present:
@@ -1666,7 +1746,11 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     ]
     for term in press_prize_terms:
         if term in detail:
-            employment_terms = ["professor", "faculty", "staff", "employee", "worked", "teaches", "graduated", "degree from"]
+            employment_terms = [
+                "professor", "faculty", "staff", "employee", "worked", "teaches", 
+                "graduated", "degree from", "studied", "distinguished", "emeritus", 
+                "alumnus", "alumna", "alum"
+            ]
             if not any(emp_term in detail for emp_term in employment_terms):
                 critical_issues.append(f"Evidence only references prize term '{term}' without employment")
         elif term in all_text:
@@ -1679,7 +1763,11 @@ def _detect_false_positive_patterns(decision: Dict[str, str], results: List[Dict
     ]
     for term in publishing_terms:
         if term in detail:
-            employment_terms = ["professor", "faculty", "staff", "employee", "worked", "teaches", "graduated", "degree from"]
+            employment_terms = [
+                "professor", "faculty", "staff", "employee", "worked", "teaches", 
+                "graduated", "degree from", "studied", "distinguished", "emeritus",
+                "alumnus", "alumna", "alum"
+            ]
             if not any(emp_term in detail for emp_term in employment_terms):
                 critical_issues.append(f"Evidence references publishing term '{term}' without employment markers")
         elif term in all_text:
@@ -1769,6 +1857,7 @@ async def analyze_connection(
     debug: bool = False,
     max_retries: int = 3,
     per_attempt_timeout: float = 30.0,  # Reduced to 30s for faster failure detection (allows 3 retries within 180s)
+    vip_mode: bool = False,
 ) -> Dict[str, str]:
     """Analyze connection with retries and per-attempt timeout.
     
@@ -1783,11 +1872,12 @@ async def analyze_connection(
     name = _safe_text(name)
     institution = _safe_text(institution)
 
-    prompt = _build_prompt(name, institution, results or [])
+    prompt = _build_prompt(name, institution, results or [], vip_mode=vip_mode)
     if debug or _PROMPT_LOGGING_ENABLED:
         separator = "=" * 48
-        print(f"{separator}\n[LLM PROMPT] {name} ↔ {institution}\n{separator}")
-        print(prompt)
+        header = _console_safe(f"{separator}\n[LLM PROMPT] {name} <-> {institution}\n{separator}")
+        print(header)
+        print(_console_safe(prompt))
         print(f"{separator}\n[END PROMPT]\n{separator}")
 
     last_error: Optional[str] = None
@@ -1856,6 +1946,27 @@ async def analyze_connection(
                     decision["confidence"] = "medium"
                     if debug:
                         print(f"[LLM] Reduced confidence to medium due to false positive pattern")
+            
+            # NEW: Confidence calibration for weak positives
+            # If LLM says connected=Y but max_relevance_score < 10, downgrade confidence
+            if decision.get("connected") == "Y" and results:
+                max_relevance = max((r.get("signals", {}).get("relevance_score", 0) for r in results), default=0)
+                if max_relevance < 10:
+                    if debug:
+                        print(f"[LLM] Weak positive detected: connected=Y but max_relevance_score={max_relevance} < 10")
+                    # Downgrade confidence and mark for review
+                    if decision.get("confidence") != "low":
+                        decision["confidence"] = "low"
+                        if debug:
+                            print(f"[LLM] Downgraded confidence to low")
+                    decision["verification_status"] = "needs_review"
+                    # Add note to temporal_context
+                    existing_evidence = decision.get("temporal_context", "")
+                    note = f"Weak search signals (max relevance: {max_relevance})"
+                    merged = f"{existing_evidence}; {note}" if existing_evidence else note
+                    decision["temporal_context"] = merged
+                    decision["temporal_evidence"] = merged
+            
             # Disabled: Trust LLM decision 99.9% of the time
             # elif decision.get("connected") != "Y":
             #     rescued = _auto_rescue_decision(decision, name, institution, results or [])

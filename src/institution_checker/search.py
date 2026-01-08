@@ -2,10 +2,12 @@ import asyncio
 import random
 import re
 import shutil
+import time
 import unicodedata
+import base64
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
@@ -25,6 +27,16 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     launch = None
     PyppeteerTimeoutError = Exception
+
+try:
+    from ddgs import DDGS
+    DDGS_AVAILABLE = True
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS
+        DDGS_AVAILABLE = True
+    except ImportError:
+        DDGS_AVAILABLE = False
 
 # Custom exception handler to only suppress pyppeteer protocol errors, not all exceptions
 def _custom_exception_handler(loop, context):
@@ -69,11 +81,14 @@ ACADEMIC_TERMS = [
     "assistant professor",
     "associate professor",
     "professor",
+    "visiting professor",  # Added to boost score for visiting roles
+    "visiting scholar",    # Added to boost score for visiting roles
     "lecturer",
     "instructor",
     "faculty",
     "postdoctoral",
     "postdoc",
+    "post-doc",
     "researcher",
     "scientist",
     "student",
@@ -84,7 +99,53 @@ ACADEMIC_TERMS = [
     "bachelor",
     "master",
     "doctorate",
+    "nobel",
+    "nobel prize",
+    "laureate",
 ]
+
+# Explicit connection phrases (high-value signals)
+EXPLICIT_CONNECTION_PHRASES = [
+    "professor at",
+    "professor of",
+    "assistant professor at",
+    "associate professor at",
+    "faculty at",
+    "faculty member at",
+    "works at",
+    "employed at",
+    "graduated from",
+    "degree from",
+    "phd from",
+    "postdoc at",
+    "post-doc at",
+    "postdoctoral fellow at",
+    "research fellow at",
+    "visiting scholar at",
+    "visiting professor at",
+    "bachelor from",
+    "master from",
+    "alumnus of",
+    "alumna of",
+    "alumni of",
+    "studied at",
+    "student at",
+]
+
+# Event/prize patterns (reduce false positives)
+EVENT_PRIZE_PATTERNS = [
+    "keynote",
+    "speaker at",
+    "gave talk at",
+    "presented at",
+    "lecture at",
+    "symposium at",
+    "conference at",
+    # "prize from",  # Removed to prevent false negatives for award lists
+    # "award from",  # Removed to prevent false negatives for award lists
+    # "honorary degree", # Removed to prevent false negatives
+]
+
 TRANSITION_TERMS = [
     "joined",
     "appointed",
@@ -106,10 +167,11 @@ _CURRENT_YEAR = datetime.utcnow().year
 YEAR_WINDOW = range(_CURRENT_YEAR - 12, _CURRENT_YEAR + 1)
 RECENT_YEAR_STRINGS = {str(_CURRENT_YEAR - offset) for offset in range(0, 3)}
 
+DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
 BING_URL = "https://www.bing.com/search"
-EXCERPT_FETCH_LIMIT = 4
-EXCERPT_HTTP_TIMEOUT = 8.0  # seconds
-EXCERPT_MAX_CHARS = 600
+EXCERPT_FETCH_LIMIT = 8  # Increased from 4 to ensure we get evidence for top results
+EXCERPT_HTTP_TIMEOUT = 6.0  # seconds (reduced for speed)
+EXCERPT_MAX_CHARS = 800  # Increased from 600 to capture more context
 _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
 _EXCERPT_SKIP_EXTENSIONS = (
     ".pdf",
@@ -161,6 +223,20 @@ CONSENT_SELECTORS = [
     'button[aria-label*="accept"]',
 ]
 
+DOMAIN_BLACKLIST = {
+    "zhihu.com",
+    "facebook.com",
+    "twitter.com",
+    "instagram.com",
+    "tiktok.com",
+    "pinterest.com",
+    "reddit.com",
+    "quora.com",
+    "youtube.com",
+    "vimeo.com",
+    "dailymotion.com",
+}
+
 
 
 
@@ -173,13 +249,52 @@ class QueryStrategy:
     ensure_tokens: bool = True
 
 
+@dataclass(frozen=True)
+class TargetTokens:
+    person: Tuple[str, ...]
+    institution: Tuple[str, ...]
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.person or self.institution)
+
+    @property
+    def has_person_tokens(self) -> bool:
+        return bool(self.person)
+
+    @property
+    def has_institution_tokens(self) -> bool:
+        return bool(self.institution)
+
+    @property
+    def all_tokens(self) -> Tuple[str, ...]:
+        return self.person + self.institution
+
+
 _http_client: Optional[httpx.AsyncClient] = None
 _http_lock = asyncio.Lock()
 _global_browser = None
 _browser_lock = asyncio.Lock()
 _browser_page_pool: List = []
 _browser_page_lock = asyncio.Lock()
-_BROWSER_PAGE_POOL_SIZE = 6
+_BROWSER_PAGE_POOL_SIZE = 30
+_browser_semaphore = asyncio.Semaphore(8)  # Limit concurrent browser pages (balanced for speed/stability)
+
+# Global rate limiter for Bing
+_last_request_time = 0.0
+_request_interval = 0.6  # Minimum seconds between requests (0.6s = ~6000 req/hr)
+_rate_limit_lock = asyncio.Lock()
+
+async def _wait_for_rate_limit():
+    global _last_request_time
+    async with _rate_limit_lock:
+        now = time.time()
+        elapsed = now - _last_request_time
+        if elapsed < _request_interval:
+            delay = _request_interval - elapsed
+            await asyncio.sleep(delay)
+        _last_request_time = time.time()
+
 _FILTERED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
 
@@ -216,13 +331,21 @@ def _fix_text_encoding(text: str) -> str:
             fixed = ftfy.fix_text(text)
             # Only return the fixed version if it's actually different and looks better
             # (ftfy is conservative and won't change text unless it's clearly broken)
-            return fixed
+            return _strip_control_characters(fixed)
         except Exception:
-            # If ftfy fails, return original text
-            return text
+            pass
     
-    # Fallback if ftfy is not available: just return the text as-is
-    return text
+    # Fallback if ftfy is not available: just return text stripped of control characters
+    return _strip_control_characters(text)
+
+
+def _strip_control_characters(text: str) -> str:
+    if not text:
+        return text
+    return "".join(
+        ch for ch in text
+        if (unicodedata.category(ch)[0] != "C") or ch in {"\n", "\r", "\t"}
+    )
 
 
 def _normalise_whitespace(value: str) -> str:
@@ -243,8 +366,8 @@ def _normalize_name_for_matching(name: str) -> str:
     normalized = _normalise_whitespace(normalized).lower()
     # Remove diacritics
     normalized = _remove_diacritics(normalized)
-    # Remove punctuation except spaces
-    normalized = re.sub(r'[^\w\s]', '', normalized)
+    # Remove punctuation (replace with space to avoid merging words)
+    normalized = re.sub(r'[^\w\s]', ' ', normalized)
     # Collapse multiple spaces
     normalized = re.sub(r'\s+', ' ', normalized).strip()
     return normalized
@@ -342,13 +465,214 @@ def _ensure_name_and_institution(query: str, person_name: str, institution: str)
     if institution:
         # Check if the unquoted institution is already in the query
         normalized_institution = _normalise_whitespace(institution).lower()
-        if normalized_institution and normalized_institution not in lowered:
+        # FIX: If site: operator is present, we don't need to force institution name
+        has_site_operator = "site:" in lowered
+        if normalized_institution and normalized_institution not in lowered and not has_site_operator:
             # Institution not in query, add it with quotes
             institution_clause = _quote_clause(institution)
             parts.append(institution_clause)
     if parts:
         query = _compose_query(*parts, query)
     return query
+
+
+def _collect_target_tokens(person_name: str, institution: str) -> TargetTokens:
+    person_tokens: set[str] = set()
+    normalized_person = _normalize_name_for_matching(person_name)
+    if normalized_person and " " in normalized_person:
+        person_tokens.add(normalized_person)
+    components = _extract_name_components(person_name)
+    for value in components.get("last", []):
+        normalized = _normalize_name_for_matching(value)
+        if normalized and len(normalized) >= 3:
+            person_tokens.add(normalized)
+
+    institution_tokens: set[str] = set()
+    normalized_institution = _normalize_name_for_matching(institution)
+    if normalized_institution:
+        institution_tokens.add(normalized_institution)
+    for token in _institution_tokens(institution):
+        normalized = _normalize_name_for_matching(token)
+        if normalized and len(normalized) >= 4 and normalized not in {"university", "college"}:
+            institution_tokens.add(normalized)
+
+    def _ordered(items: Iterable[str]) -> Tuple[str, ...]:
+        return tuple(sorted({item for item in items if item}, key=lambda value: (-len(value), value)))
+
+    return TargetTokens(
+        person=_ordered(person_tokens),
+        institution=_ordered(institution_tokens),
+    )
+
+
+def _result_mentions_target(result: Dict[str, object], tokens: TargetTokens) -> bool:
+    if tokens.is_empty:
+        return False
+
+    signals = result.get("signals", {}) or {}
+    text_parts = [
+        result.get("title", ""),
+        result.get("snippet", ""),
+        result.get("page_excerpt", ""),
+        result.get("description", ""),
+        result.get("url", ""),
+    ]
+    merged = _normalize_name_for_matching(
+        " ".join(str(part) for part in text_parts if part)
+    )
+
+    person_hit = not tokens.has_person_tokens
+    if tokens.has_person_tokens:
+        if signals.get("has_person_name"):
+            person_hit = True
+        elif merged:
+            person_hit = any(token in merged for token in tokens.person)
+
+    institution_hit = not tokens.has_institution_tokens
+    if tokens.has_institution_tokens:
+        if signals.get("has_institution"):
+            institution_hit = True
+        elif merged:
+            institution_hit = any(token in merged for token in tokens.institution)
+
+    return person_hit and institution_hit
+
+
+def _count_target_hits(results: List[Dict[str, object]], tokens: TargetTokens, limit: int = 10) -> int:
+    if tokens.is_empty or not results:
+        return 0
+    hits = 0
+    for result in results[:limit]:
+        if _result_mentions_target(result, tokens):
+            hits += 1
+    return hits
+
+
+def _needs_duckduckgo_fallback(
+    results: List[Dict[str, object]],
+    person_name: str,
+    institution: str,
+) -> bool:
+    if not results:
+        return True
+    
+    # Quality-Aware Fallback: Check max relevance score
+    # If httpx results have max score < 5, they are likely garbage (shopping links, unrelated content)
+    # This triggers DDG fallback to find better results
+    max_score = max((r.get("signals", {}).get("relevance_score", 0) for r in results), default=0)
+    if max_score < 5:
+        return True
+    
+    # Also check if we have any high-quality results (score >= 10)
+    # If we have results but none are good, we need backup
+    has_high_quality = any(
+        r.get("signals", {}).get("relevance_score", 0) >= 10 
+        for r in results
+    )
+    if not has_high_quality:
+        return True
+
+    tokens = _collect_target_tokens(person_name, institution)
+    if tokens.is_empty:
+        return False
+    subset = results[: min(len(results), 10)]
+    hits = _count_target_hits(subset, tokens, limit=len(subset))
+    if len(subset) <= 3:
+        return hits == 0
+    if len(subset) <= 5:
+        return hits < 2
+    return hits < 3
+
+
+def _has_sufficient_target_hits(
+    results: List[Dict[str, object]],
+    person_name: str,
+    institution: str,
+) -> bool:
+    if not results:
+        return False
+    tokens = _collect_target_tokens(person_name, institution)
+    if tokens.is_empty:
+        return bool(results)
+    subset = results[: min(len(results), 10)]
+    hits = _count_target_hits(subset, tokens, limit=len(subset))
+    if len(subset) <= 3:
+        return hits >= 1
+    if len(subset) <= 5:
+        return hits >= 2
+    return hits >= 3
+
+
+def _prioritize_target_hits(
+    results: List[Dict[str, object]],
+    person_name: str,
+    institution: str,
+) -> List[Dict[str, object]]:
+    tokens = _collect_target_tokens(person_name, institution)
+    if tokens.is_empty:
+        return results
+    relevant: List[Dict[str, object]] = []
+    others: List[Dict[str, object]] = []
+    for item in results:
+        if _result_mentions_target(item, tokens):
+            relevant.append(item)
+        else:
+            others.append(item)
+    if not relevant:
+        return results
+    return relevant + others
+
+
+_PLACE_SUFFIX_TOKENS = {
+    "weg",
+    "street",
+    "st",
+    "road",
+    "rd",
+    "strasse",
+    "straße",
+    "platz",
+    "plaza",
+    "hall",
+    "building",
+    "tower",
+    "center",
+    "centre",
+    "wing",
+    "lab",
+    "laboratory",
+    "auditorium",
+    "library",
+}
+
+_PLACE_PREFIX_TOKENS = {
+    "hall",
+    "building",
+    "tower",
+    "center",
+    "centre",
+    "laboratory",
+    "lab",
+}
+
+
+def _name_pair_place_status(text_tokens: List[str], first_token: str, last_token: str) -> Tuple[bool, bool]:
+    """Return (has_pair, has_non_place_pair) for contiguous first/last tokens."""
+    has_pair = False
+    has_non_place_pair = False
+    if not first_token or not last_token:
+        return has_pair, has_non_place_pair
+    upper_bound = len(text_tokens) - 1
+    for idx in range(upper_bound):
+        if text_tokens[idx] != first_token or text_tokens[idx + 1] != last_token:
+            continue
+        has_pair = True
+        prev_token = text_tokens[idx - 1] if idx > 0 else ""
+        next_idx = idx + 2
+        next_token = text_tokens[next_idx] if next_idx < len(text_tokens) else ""
+        if next_token not in _PLACE_SUFFIX_TOKENS and prev_token not in _PLACE_PREFIX_TOKENS:
+            has_non_place_pair = True
+    return has_pair, has_non_place_pair
 
 
 def _name_matches(text: str, person_name: str) -> bool:
@@ -360,6 +684,7 @@ def _name_matches(text: str, person_name: str) -> bool:
     """
     # Normalize both text and name for comparison
     normalized_text = _normalize_name_for_matching(text)
+    text_tokens = normalized_text.split()
     normalized_name = _normalize_name_for_matching(person_name)
     
     # Quick exact match
@@ -377,7 +702,7 @@ def _name_matches(text: str, person_name: str) -> bool:
     if not first_names or not last_names:
         # If we only have one name part, do simple matching
         return normalized_name in normalized_text
-    
+    place_only_pair = False
     def _token_in_text(token: str) -> bool:
         if not token:
             return False
@@ -432,9 +757,11 @@ def _name_matches(text: str, person_name: str) -> bool:
                     return True
             
             # Pattern 3: First Last (no middle)
-            pattern = re.compile(rf'\b{re.escape(first_token)}\s+{re.escape(last_token)}\b')
-            if pattern.search(normalized_text):
+            pair_found, pair_clean = _name_pair_place_status(text_tokens, first_token, last_token)
+            if pair_clean:
                 return True
+            if pair_found:
+                place_only_pair = True
             
             # Pattern 4: Last, First (reversed with optional comma)
             pattern = re.compile(rf'\b{re.escape(last_token)}\s*,?\s+{re.escape(first_token)}\b')
@@ -442,6 +769,8 @@ def _name_matches(text: str, person_name: str) -> bool:
                 return True
     
     # Fallback: first/last tokens both present somewhere in the text
+    if place_only_pair:
+        return False
     return True
 
 
@@ -526,6 +855,30 @@ def _resolve_bing_redirect(url: str) -> str:
             # Look for the 'u' parameter which contains the actual URL
             if 'u' in params:
                 actual_url = params['u']
+                
+                # Try Base64 decoding (Bing often uses a1 + base64)
+                if actual_url.startswith('a1'):
+                    try:
+                        # Strip 'a1' prefix and add padding if needed
+                        b64_str = actual_url[2:]
+                        # Replace characters that might be different in Bing's encoding if needed
+                        # But usually it's standard base64url or similar.
+                        # Fix padding
+                        padding = len(b64_str) % 4
+                        if padding:
+                            b64_str += '=' * (4 - padding)
+                        
+                        # Try standard base64 first, then urlsafe
+                        try:
+                            decoded_bytes = base64.urlsafe_b64decode(b64_str)
+                        except Exception:
+                            decoded_bytes = base64.b64decode(b64_str)
+                            
+                        decoded = decoded_bytes.decode('utf-8')
+                        return _normalise_url(decoded)
+                    except Exception:
+                        pass
+
                 # The URL might be base64 encoded or URL encoded
                 # Try to decode and normalize
                 try:
@@ -544,6 +897,24 @@ def _resolve_bing_redirect(url: str) -> str:
         return _normalise_url(url)
     except Exception:
         return url
+
+
+def _decode_duckduckgo_redirect(url: str) -> str:
+    """Decode DuckDuckGo redirect links (//duckduckgo.com/l/...) to destination URLs."""
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = f"https:{url}"
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if "duckduckgo.com" in parsed.netloc.lower() and parsed.path.startswith("/l/"):
+        params = dict(parse_qsl(parsed.query))
+        target = params.get("uddg")
+        if target:
+            return _normalise_url(target)
+    return _normalise_url(url)
 
 
 def _is_joint_campus_mention(text: str) -> bool:
@@ -571,6 +942,22 @@ def _compute_signals(
     has_recent_year = any(year in text for year in RECENT_YEAR_STRINGS)
     has_timeline = any(str(year) in text for year in YEAR_WINDOW)
     is_joint_campus = _is_joint_campus_mention(text)
+    
+    # NEW: Check for explicit connection phrases (high-value signals)
+    has_explicit_connection = _contains_any(text, EXPLICIT_CONNECTION_PHRASES)
+    
+    # NEW: Check for event/prize patterns (false positive indicators)
+    has_event_prize_pattern = _contains_any(text, EVENT_PRIZE_PATTERNS)
+    
+    # NEW: Check proximity of person and institution mentions
+    has_proximity = False
+    if has_person and has_institution:
+        # Simple proximity check: both appear in title or within same sentence
+        title_lower = title.lower()
+        if person_name and institution:
+            person_in_title = any(token.lower() in title_lower for token in person_name.split() if len(token) > 2)
+            inst_in_title = any(token in title_lower for token in _institution_tokens(institution))
+            has_proximity = person_in_title and inst_in_title
 
     score = 0
     if has_person:
@@ -598,6 +985,25 @@ def _compute_signals(
     if any(site in domain for site in PROFILE_SITES):
         score += 1
     
+    # NEW: Bonus for explicit connection phrases
+    if has_explicit_connection:
+        score += 5
+        if domain.endswith(".edu"):
+            score += 3  # Extra bonus for .edu + explicit connection
+    
+    # NEW: Bonus for PhD/Degree + Institution (strong alumni signal)
+    has_degree_signal = any(term in text for term in ["phd", "degree", "doctorate", "graduated"])
+    if has_degree_signal and has_institution:
+        score += 5
+    
+    # NEW: Bonus for proximity
+    if has_proximity:
+        score += 4
+    
+    # NEW: Penalty for event/prize patterns
+    if has_event_prize_pattern and not has_explicit_connection:
+        score = max(0, score - 6)  # Moderate penalty unless explicit connection phrase present
+    
     # Apply penalty for joint campus mentions if not accepting them
     if is_joint_campus and not ACCEPT_JOINT_CAMPUSES:
         score = max(0, score - 8)  # Heavy penalty to deprioritize
@@ -612,6 +1018,9 @@ def _compute_signals(
         "has_recent_year": bool(has_recent_year),
         "has_timeline": bool(has_timeline),
         "is_joint_campus": bool(is_joint_campus),
+        "has_explicit_connection": bool(has_explicit_connection),
+        "has_event_prize_pattern": bool(has_event_prize_pattern),
+        "has_proximity": bool(has_proximity),
         "domain": domain,
         "relevance_score": score,
     }
@@ -655,12 +1064,62 @@ def _ensure_person_signal(
     return updated
 
 
+def _deduplicate_results(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    seen: Dict[str, Dict[str, object]] = {}
+    ordered: List[str] = []
+    for result in results:
+        url = result.get("url")
+        if not url:
+            continue
+        normalized = _normalise_url(url)
+        if normalized in seen:
+            existing = seen[normalized]
+            merged = _merge_results(existing, result)
+            seen[normalized] = merged
+        else:
+            seen[normalized] = result
+            ordered.append(normalized)
+    return [seen[key] for key in ordered]
+
+
+def _prepare_ranked_results(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    deduped = _deduplicate_results(results)
+    deduped.sort(
+        key=lambda item: (
+            item.get("signals", {}).get("source_rank", float("inf")),
+            -item.get("signals", {}).get("relevance_score", 0),
+            -len(item.get("snippet", "")),
+        )
+    )
+    for idx, item in enumerate(deduped, start=1):
+        item["rank"] = idx
+        signals = item.setdefault("signals", {})
+        if "source_rank" not in signals or not isinstance(signals.get("source_rank"), int):
+            signals["source_rank"] = idx
+    return deduped
+
+
+def _split_duckduckgo_text(text: str) -> Tuple[str, str]:
+    working = text.strip()
+    working = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", working)
+    working = working.replace("Flag AI-generated image", "")
+    working = working.replace("Report inappropriate image", "")
+    working = working.replace("**", "")
+    if working.startswith("### "):
+        working = working[4:]
+    working = _normalise_whitespace(working)
+    if " - " in working:
+        title, snippet = working.split(" - ", 1)
+        return _normalise_whitespace(title), _normalise_whitespace(snippet)
+    return _normalise_whitespace(working), ""
+
+
 async def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     async with _http_lock:
         if _http_client is None:
             timeout = httpx.Timeout(10.0, connect=5.0, read=10.0)
-            limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            limits = httpx.Limits(max_connections=30, max_keepalive_connections=10)
             _http_client = httpx.AsyncClient(
                 timeout=timeout,
                 limits=limits,
@@ -676,6 +1135,7 @@ async def _fetch_with_httpx(query: str, count: int, debug: bool = False) -> str:
     
     for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
         try:
+            await _wait_for_rate_limit()
             response = await client.get(
                 BING_URL,
                 params=params,
@@ -717,6 +1177,213 @@ async def _fetch_with_httpx(query: str, count: int, debug: bool = False) -> str:
     return ""
 
 
+# Global semaphore for DuckDuckGo to prevent rate limiting
+_ddg_semaphore = asyncio.Semaphore(3)
+
+_DDG_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+]
+
+async def _duckduckgo_search(
+    query: str,
+    institution: str,
+    person_name: str,
+    limit: int,
+    debug: bool = False,
+) -> List[Dict[str, object]]:
+    # 1. Try duckduckgo_search library first if available
+    if DDGS_AVAILABLE:
+        try:
+            if debug:
+                print(f"[search] Using duckduckgo_search library for: {query}")
+            
+            def _run_ddgs():
+                res = []
+                # Use context manager to ensure cleanup
+                with DDGS() as ddgs:
+                    # fetch a few more to filter
+                    for r in ddgs.text(query, max_results=max(limit, 20)):
+                        res.append(r)
+                return res
+
+            loop = asyncio.get_running_loop()
+            async with _ddg_semaphore:
+                # Use executor to avoid blocking the event loop
+                ddg_results = await loop.run_in_executor(None, _run_ddgs)
+            
+            if debug:
+                 print(f"[search] duckduckgo_search library returned {len(ddg_results)} raw results")
+
+            results: List[Dict[str, object]] = []
+            for r in ddg_results:
+                if len(results) >= limit:
+                    break
+                
+                title = r.get("title", "")
+                url = r.get("href", "")
+                snippet = r.get("body", "")
+                
+                if not url.startswith(("http://", "https://")):
+                    continue
+                
+                domain = urlparse(url).netloc.lower()
+                base_domain = domain.replace("www.", "")
+                if any(blocked in base_domain for blocked in DOMAIN_BLACKLIST):
+                    continue
+
+                signals = _compute_signals(title, snippet, url, institution, person_name)
+                # Ensure we have person match signals
+                signals = _ensure_person_signal(signals, url, institution, person_name)
+
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                    "signals": signals,
+                    "source": "duckduckgo_lib"
+                })
+            
+            if results:
+                 if debug:
+                     print(f"[search] duckduckgo_search library yielded {len(results)} valid results")
+                 return results
+                 
+        except Exception as e:
+            if debug:
+                print(f"[search] duckduckgo_search library failed, falling back to manual scraping: {e}")
+            pass
+
+    client = await _get_http_client()
+    # Base headers
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://html.duckduckgo.com/",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1"
+    }
+    
+    # Use direct HTML endpoint
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": query, "kl": "us-en"}
+    
+    # Retry logic with backoff and semaphore
+    html = ""
+    async with _ddg_semaphore:
+        # Add random delay to spread out requests
+        await asyncio.sleep(random.uniform(0.8, 1.5))
+        
+        for attempt in range(1, 4):
+            # Rotate UA
+            headers["User-Agent"] = random.choice(_DDG_USER_AGENTS)
+            
+            try:
+                response = await client.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=20.0,
+                    follow_redirects=True
+                )
+                response.raise_for_status()
+                html = response.text
+                
+                # Check for CAPTCHA
+                if "bots use DuckDuckGo too" in html or "anomaly-modal" in html:
+                    if debug:
+                        print(f"[search] DuckDuckGo CAPTCHA detected on attempt {attempt}")
+                    # Treat as error to trigger retry
+                    raise httpx.HTTPStatusError("DDG CAPTCHA", request=response.request, response=response)
+
+                if html and len(html) > 200:
+                    break
+            except (httpx.HTTPError, httpx.TimeoutException) as exc:
+                if debug:
+                    print(f"[search] DuckDuckGo attempt {attempt} failed: {exc}")
+                if attempt < 3:
+                    await asyncio.sleep(3.0 * attempt)
+    
+    if not html or len(html) < 200:
+        if debug:
+            print("[search] DuckDuckGo HTTP failed/blocked, trying browser fallback...")
+        html = await _fetch_ddg_with_browser(query, debug=debug)
+    
+    if not html or len(html) < 200:
+        if debug:
+            print("[search] DuckDuckGo response too short/empty after retries and fallback")
+        return []
+
+    # Parse HTML directly
+    soup = BeautifulSoup(html, "html.parser")
+    results: List[Dict[str, object]] = []
+    
+    # DDG HTML structure: .result -> .result__body -> .result__title -> a.result__a
+    for result_div in soup.select(".result"):
+        if len(results) >= limit:
+            break
+            
+        title_tag = result_div.select_one(".result__a")
+        if not title_tag:
+            continue
+            
+        title = title_tag.get_text(strip=True)
+        url = title_tag.get("href", "")
+        
+        # Extract snippet
+        snippet_tag = result_div.select_one(".result__snippet")
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+        
+        # Resolve DDG redirect in URL if needed (usually /l/?kh=-1&uddg=...)
+        if "/l/?" in url:
+            try:
+                parsed = urlparse(url)
+                qs = dict(parse_qsl(parsed.query))
+                if "uddg" in qs:
+                    url = qs["uddg"]
+            except Exception:
+                pass
+                
+        if not url.startswith(("http://", "https://")):
+            continue
+            
+        # Check blacklist
+        domain = urlparse(url).netloc.lower()
+        base_domain = domain.replace("www.", "")
+        if any(blocked in base_domain for blocked in DOMAIN_BLACKLIST):
+            continue
+            
+        # Compute signals
+        signals = _compute_signals(title, snippet, url, institution, person_name)
+        signals = _ensure_person_signal(signals, url, institution, person_name)
+        
+        results.append({
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "signals": signals,
+        })
+
+    if debug:
+        print(f"[search] DuckDuckGo found {len(results)} results")
+        if len(results) == 0:
+            print(f"[search] HTML Preview: {html[:500]}...")
+            with open("debug_ddg.html", "w", encoding="utf-8") as f:
+                f.write(html)
+        
+    return results
+
+
 def _should_fetch_page_excerpt(result: Dict[str, object]) -> bool:
     """Determine if a result needs extra on-page evidence fetched."""
     url = _normalise_whitespace(str(result.get("url") or ""))
@@ -754,6 +1421,10 @@ def _should_fetch_page_excerpt(result: Dict[str, object]) -> bool:
 
     # If both person and institution already identified and snippet contains explicit evidence, skip fetch
     if has_person and has_institution:
+        # BUT if the person match came only from URL/Domain/Recovery (not snippet), we still need to fetch text!
+        # Otherwise the LLM only sees a generic snippet and might reject the connection.
+        if match_confidence in ("url", "institution_domain", "directory_recovery", "soft"):
+            return True
         return False
 
     return True
@@ -845,6 +1516,15 @@ async def _enrich_with_page_excerpts(
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def enrich_with_page_excerpts(
+    results: Iterable[Dict[str, object]],
+    person_name: str,
+    limit: int = EXCERPT_FETCH_LIMIT,
+) -> None:
+    """Public helper to attach page excerpts on-demand."""
+    await _enrich_with_page_excerpts(results, person_name, limit=limit)
+
+
 async def _get_browser():
     if launch is None or CHROME_PATH is None:
         return None
@@ -887,7 +1567,7 @@ async def _dismiss_bing_consent(page, debug: bool = False) -> bool:
                     await element.click()
                     if debug:
                         print(f"[search] Dismissed consent prompt via selector {selector!r}")
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.2)  # Reduced from 0.6s for faster processing
                     return True
                 except Exception as exc:
                     if debug:
@@ -963,53 +1643,158 @@ async def _fetch_with_browser(query: str, count: int, debug: bool = False) -> st
     release_page = None
     result_html = ""
     target_url = f"{BING_URL}?q={quote(query)}&count={count}&form=QBRE"
+    
+    # Acquire semaphore to limit concurrent browser usage
     try:
-        for attempt in range(1, BROWSER_FETCH_ATTEMPTS + 1):
-            if page is None:
-                page, release_page = await _acquire_browser_page()
-                if page is None:
-                    if debug:
-                        print("[search] Pyppeteer browser not available")
-                    break
-            try:
-                await _ensure_page_headers(page)
-                user_agent = random.choice(USER_AGENTS)
-                if getattr(page, "_ic_user_agent", None) != user_agent:
-                    await page.setUserAgent(user_agent)
-                    page._ic_user_agent = user_agent
-                await page.goto(target_url, timeout=20000, waitUntil="domcontentloaded")
-                await asyncio.sleep(0.25)
-                await _dismiss_bing_consent(page, debug=debug)
-                result_ready = False
-                for selector in SELECTORS:
+        async with _browser_semaphore:
+            # SAFETY: Wrap the entire browser interaction in a timeout to prevent hanging
+            # This ensures the semaphore is always released even if pyppeteer hangs
+            async def _do_browser_fetch():
+                nonlocal page, release_page, result_html
+                for attempt in range(1, BROWSER_FETCH_ATTEMPTS + 1):
+                    if page is None:
+                        page, release_page = await _acquire_browser_page()
+                        if page is None:
+                            if debug:
+                                print("[search] Pyppeteer browser not available")
+                            break
                     try:
-                        await page.waitForSelector(selector, {"timeout": 6000})
-                        result_ready = True
-                        break
-                    except PyppeteerTimeoutError:
-                        continue
-                    except Exception:
-                        continue
-                if not result_ready and debug:
-                    print(f"[search] Browser attempt {attempt}: no result selectors found")
-                html = await page.content()
-                if html:
-                    result_html = html
-                    break
-            except Exception as exc:
-                if debug:
-                    print(f"[search] Browser attempt {attempt} failed: {exc}")
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-                page = None
-                release_page = None
-            if attempt < BROWSER_FETCH_ATTEMPTS:
-                await asyncio.sleep(0.5 * attempt)
+                        await _wait_for_rate_limit()
+                        await _ensure_page_headers(page)
+                        user_agent = random.choice(USER_AGENTS)
+                        if getattr(page, "_ic_user_agent", None) != user_agent:
+                            await page.setUserAgent(user_agent)
+                            page._ic_user_agent = user_agent
+                        
+                        # Page load timeout 35s (increased for stability)
+                        await page.goto(target_url, timeout=35000, waitUntil="domcontentloaded")
+                        await asyncio.sleep(0.25)
+                        await _dismiss_bing_consent(page, debug=debug)
+                        result_ready = False
+                        for selector in SELECTORS:
+                            try:
+                                await page.waitForSelector(selector, {"timeout": 10000}) # 10s selector wait
+                                result_ready = True
+                                break
+                            except PyppeteerTimeoutError:
+                                continue
+                            except Exception:
+                                continue
+                        if not result_ready and debug:
+                            print(f"[search] Browser attempt {attempt}: no result selectors found")
+                        
+                        html = await page.content()
+                        
+                        # VALIDATION: Check for soft blocks / captchas
+                        lower_html = html.lower()
+                        if "captcha" in lower_html or "unusual traffic" in lower_html or "verify you are human" in lower_html:
+                            print(f"[search] Browser attempt {attempt}: DETECTED CAPTCHA/BLOCK")
+                            html = None # Treat as failure to trigger retry
+                        
+                        if html:
+                            result_html = html
+                            break
+                    except Exception as exc:
+                        if debug:
+                            print(f"[search] Browser attempt {attempt} failed: {exc}")
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                        page = None
+                        release_page = None
+                    if attempt < BROWSER_FETCH_ATTEMPTS:
+                        await asyncio.sleep(0.5 * attempt)
+            
+            # Hard timeout for the browser operation
+            await asyncio.wait_for(_do_browser_fetch(), timeout=15.0)
+            
+    except asyncio.TimeoutError:
+        if debug:
+            print(f"[search] Browser fetch HARD TIMEOUT for query: {query[:30]}...")
+    except Exception as e:
+        if debug:
+            print(f"[search] Browser fetch error: {e}")
     finally:
         if release_page and page and not _page_is_closed(page):
             await release_page(page)
+            
+    return result_html
+
+
+async def _fetch_ddg_with_browser(query: str, debug: bool = False) -> str:
+    """Fetch DuckDuckGo results using a browser (fallback for CAPTCHA)."""
+    page = None
+    release_page = None
+    result_html = ""
+    # Use HTML version in browser too for consistent parsing
+    target_url = f"https://html.duckduckgo.com/html/?q={quote(query)}&kl=us-en"
+    
+    try:
+        async with _browser_semaphore:
+            async def _do_browser_fetch():
+                nonlocal page, release_page, result_html
+                for attempt in range(1, BROWSER_FETCH_ATTEMPTS + 1):
+                    if page is None:
+                        page, release_page = await _acquire_browser_page()
+                        if page is None:
+                            if debug:
+                                print("[search] Pyppeteer browser not available for DDG")
+                            break
+                    try:
+                        await _wait_for_rate_limit()
+                        await _ensure_page_headers(page)
+                        user_agent = random.choice(USER_AGENTS)
+                        if getattr(page, "_ic_user_agent", None) != user_agent:
+                            await page.setUserAgent(user_agent)
+                            page._ic_user_agent = user_agent
+                        
+                        if debug:
+                            print(f"[search] DDG Browser attempt {attempt} for '{query}'")
+                        
+                        await page.goto(target_url, timeout=30000, waitUntil="domcontentloaded")
+                        await asyncio.sleep(1.5) # Wait for JS/Rendering
+                        
+                        # Check for results (HTML version uses .result)
+                        try:
+                            await page.waitForSelector(".result", {"timeout": 5000})
+                        except Exception:
+                            pass
+                        
+                        html = await page.content()
+                        
+                        # Check for CAPTCHA
+                        if "bots use DuckDuckGo too" in html or "anomaly-modal" in html:
+                            if debug:
+                                print(f"[search] DDG Browser attempt {attempt}: CAPTCHA detected")
+                            html = None # Retry
+                        
+                        if html:
+                            result_html = html
+                            break
+                            
+                    except Exception as exc:
+                        if debug:
+                            print(f"[search] DDG Browser attempt {attempt} failed: {exc}")
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                        page = None
+                        release_page = None
+                    
+                    if attempt < BROWSER_FETCH_ATTEMPTS:
+                        await asyncio.sleep(1.0 * attempt)
+            
+            await asyncio.wait_for(_do_browser_fetch(), timeout=45.0)
+            
+    except Exception as e:
+        if debug:
+            print(f"[search] DDG Browser fetch error: {e}")
+    finally:
+        if release_page and page and not _page_is_closed(page):
+            await release_page(page)
+            
     return result_html
 
 
@@ -1075,6 +1860,17 @@ def _parse_result_element(
     url = _resolve_bing_redirect(url)
     url = _normalise_url(url)
     
+    # Ensure resolved URL is valid and absolute
+    if not url.startswith(("http://", "https://")):
+        return None
+    
+    # Check blacklist
+    domain = urlparse(url).netloc.lower()
+    # Remove www. prefix for checking
+    base_domain = domain.replace("www.", "")
+    if any(blocked in base_domain for blocked in DOMAIN_BLACKLIST):
+        return None
+    
     title = _normalise_whitespace(anchor.get_text(" ", strip=True))
     if not title:
         return None
@@ -1082,9 +1878,121 @@ def _parse_result_element(
     signals = _compute_signals(title, snippet, url, institution, person_name)
     signals = _ensure_person_signal(signals, url, institution, person_name)
     
-    # Return the result - don't filter out "weak" results
-    # Let the LLM decide if they're relevant. Even results with no name/institution match
-    # might contain relevant information when combined with the query context.
+    # QUALITY FILTER 1: Exclude completely irrelevant results (neither person nor institution)
+    # These are pure noise (e.g., generic Reddit links, ads, unrelated content)
+    has_person = signals.get("has_person_name", False)
+    has_institution = signals.get("has_institution", False)
+    
+    # NEW: Strict Person Filter
+    # If we are searching for a person, the result MUST mention them (at least last name).
+    if person_name:
+        # If signals found the person, we are good.
+        # If not, we check for last name tokens to avoid keeping generic institution pages.
+        if not has_person:
+            combined_text = f"{title} {snippet} {url}".lower()
+            
+            # Use _collect_target_tokens to get robust last name tokens
+            target_tokens = _collect_target_tokens(person_name, "")
+            person_tokens = target_tokens.person
+            
+            found_token = False
+            if person_tokens:
+                for token in person_tokens:
+                    # Use word boundary check for short tokens to avoid false positives
+                    if len(token) < 4:
+                        if re.search(rf"\b{re.escape(token)}\b", combined_text):
+                            found_token = True
+                            break
+                    elif token in combined_text:
+                        found_token = True
+                        break
+            else:
+                # Fallback for names that didn't generate tokens
+                normalized_name = _normalize_name_for_matching(person_name)
+                if normalized_name in combined_text:
+                    found_token = True
+            
+            if not found_token:
+                # RECOVERY: If this looks like a relevant institutional page (directory, department, alumni list),
+                # keep it to allow deep inspection (fetching page excerpt).
+                # This rescues pages like "Purdue Chemistry Faculty" where the name is on the page but not the snippet.
+                is_directory_page = False
+                if has_institution:
+                    # Check for directory indicators in URL or text
+                    # Expanded list to capture lists of people/awards
+                    dir_keywords = {
+                        "directory", "faculty", "staff", "people", "department", "school", "college", 
+                        "alumni", "laureates", "awards", "recipients", "winners", "fellows", "members",
+                        "history", "archive", "news"
+                    }
+                    if any(kw in combined_text for kw in dir_keywords):
+                        is_directory_page = True
+                        # Boost relevance slightly to ensure it survives ranking if it was low
+                        if signals.get("relevance_score", 0) < 5:
+                            signals["relevance_score"] = 5
+                            signals["person_match_confidence"] = "directory_recovery"
+
+                if not is_directory_page:
+                    # RELAXED: If we have a strong institution match, keep it but mark as low confidence
+                    # This allows the LLM or page fetcher to verify.
+                    if has_institution:
+                        signals["person_match_confidence"] = "soft_recovery"
+                    else:
+                        return None  # Filter out: no person token found AND not a directory page
+
+    if not has_person and not has_institution:
+        # Double-check: Sometimes names/institutions are in URL or snippet but missed by signals
+        combined_text = f"{title} {snippet} {url}".lower()
+        
+        # Check for person name (last name at minimum, 4+ chars to avoid false positives)
+        person_in_text = False
+        if person_name:
+            name_parts = person_name.lower().split()
+            if len(name_parts) >= 2:
+                last_name = name_parts[-1]
+                if len(last_name) >= 4 and last_name in combined_text:
+                    person_in_text = True
+        
+        # Check for institution (any token)
+        institution_in_text = False
+        if institution:
+            inst_tokens = _institution_tokens(institution)
+            if any(token in combined_text for token in inst_tokens):
+                institution_in_text = True
+        
+        # If neither appears anywhere, this is completely irrelevant
+        if not person_in_text and not institution_in_text:
+            # DEBUG: Print why we are dropping
+            # print(f"[search] Dropping irrelevant result: {title} (No person/inst match)")
+            return None  # Filter out: no connection to search query
+    
+    # QUALITY FILTER 2: Exclude weak pronoun-only mentions
+    # Results that mention institution but only use pronouns (not actual name) are usually weak
+    if has_institution and not has_person:
+        combined_text = f"{title} {snippet}".lower()
+        
+        # Check for weak pronoun patterns that often indicate indirect/weak mentions
+        weak_pronoun_patterns = [
+            r'\bhe\s+was\b',
+            r'\bshe\s+was\b',
+            r'\bthey\s+were\b',
+            r'\bhis\s+work\b',
+            r'\bher\s+research\b',
+            r'\btheir\s+study\b',
+        ]
+        
+        has_weak_pronoun = any(re.search(pattern, combined_text) for pattern in weak_pronoun_patterns)
+        
+        if has_weak_pronoun:
+            # Only keep if it has other strong signals that justify inclusion
+            relevance_score = signals.get("relevance_score", 0)
+            has_explicit_connection = signals.get("has_explicit_connection", False)
+            
+            # Keep only if score is high (15+) OR explicit connection phrase found
+            if relevance_score < 15 and not has_explicit_connection:
+                return None  # Filter out: weak pronoun reference without strong evidence
+    
+    # Passed quality filters - return the result
     return {
         "title": title,
         "url": url,
@@ -1132,36 +2040,6 @@ def _extract_results(
         results.append(parsed)
         if len(results) >= limit:
             break
-    if not results:  # fallback to generic anchors if structured parsing failed
-        for anchor in soup.select("a[href]"):
-            url = anchor.get("href", "").strip()
-            if not url.startswith(("http://", "https://")):
-                continue
-            
-            # Resolve Bing redirects
-            url = _resolve_bing_redirect(url)
-            url = _normalise_url(url)
-            
-            if url in seen_urls:
-                continue
-            rank_counter += 1
-            title = _normalise_whitespace(anchor.get_text(" ", strip=True))
-            if len(title) < 8:
-                continue
-            snippet = ""
-            signals = _compute_signals(title, snippet, url, institution, person_name)
-            signals = _ensure_person_signal(signals, url, institution, person_name)
-            signals.setdefault("source_rank", rank_counter)
-            results.append({
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "signals": signals,
-                "rank": rank_counter,
-            })
-            seen_urls.add(url)
-            if len(results) >= limit:
-                break
     return results
 
 
@@ -1171,29 +2049,80 @@ async def bing_search(
     institution: str = "",
     person_name: str = "",
     debug: bool = False,
+    allow_fallback: bool = True,
+    fetch_excerpts: bool = True,
+    ddg_min_results: int = 5,
+    ensure_tokens: bool = True,
 ) -> List[Dict[str, object]]:
-    query = _ensure_name_and_institution(query, person_name, institution)
+    if ensure_tokens:
+        query = _ensure_name_and_institution(query, person_name, institution)
     target = max(num_results, 10)
+    
+    # STRATEGY UPDATE: Prioritize DuckDuckGo for speed and reliability (avoids Bing blocks)
+    # This helps meet the <4s per name target and improves recall on blocked queries.
+    if allow_fallback:
+        if debug:
+            print("[search] Attempting DuckDuckGo first for speed/reliability...")
+        ddg_results = await _duckduckgo_search(
+            query,
+            institution=institution,
+            person_name=person_name,
+            limit=max(num_results, 20),
+            debug=debug,
+        )
+        
+        # If DDG gives good results, use them and skip slow Bing scraping
+        if ddg_results and (
+            len(ddg_results) >= ddg_min_results
+            or _has_sufficient_target_hits(ddg_results, person_name, institution)
+        ):
+            if debug:
+                print(f"[search] DuckDuckGo returned {len(ddg_results)} results, skipping Bing")
+            
+            prepared = _prepare_ranked_results(ddg_results)
+            prepared = _prioritize_target_hits(prepared, person_name, institution)
+            top_results = prepared[:num_results]
+            if top_results and fetch_excerpts:
+                await _enrich_with_page_excerpts(top_results, person_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
+            return top_results
+            
+    # Fallback to Bing if DDG failed or returned nothing
     # Fetch more results from HTML to account for filtering/deduplication
-    # Request 3x to ensure we get enough after extraction (was 2x)
-    fetch_count = min(target * 3, 100)
-    html = await _fetch_with_browser(query, count=fetch_count, debug=debug)
+    fetch_count = min(target * 5, 150)
+    if person_name:
+        fetch_count = max(fetch_count, 100)
+        
+    # Try HTTPX first (faster than browser)
+    html = await _fetch_with_httpx(query, count=fetch_count, debug=debug)
+    
+    # Only use browser if HTTPX fails (slow path)
     if not html:
         if debug:
-            print("[search] Browser fetch returned no content, falling back to HTTP client")
-        html = await _fetch_with_httpx(query, count=fetch_count, debug=debug)
+            print("[search] HTTP fetch failed, trying browser (slow path)...")
+        html = await _fetch_with_browser(query, count=fetch_count, debug=debug)
+
     if not html:
+        # If both Bing methods failed and we haven't tried DDG yet (allow_fallback=False), return empty
+        # If we already tried DDG (allow_fallback=True) and it failed, we also return empty
         return []
+
     results = _extract_results(
         html,
         institution=institution,
-        limit=num_results * 3,  # Extract more to account for filtering
+        limit=num_results * 3,
         person_name=person_name,
         debug=debug,
     )
-    results.sort(key=lambda item: item.get("rank") or item["signals"].get("source_rank", float("inf")))
-    top_results = results[:num_results]
-    await _enrich_with_page_excerpts(top_results, person_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
+    
+    # If Bing returned results but they are poor, and we haven't tried DDG yet (unlikely with new logic),
+    # or if we want to mix in DDG results (not implemented here to keep it simple).
+    # Since we moved DDG to the front, we don't need the post-search fallback as much.
+    
+    prepared = _prepare_ranked_results(results)
+    prepared = _prioritize_target_hits(prepared, person_name, institution)
+    top_results = prepared[:num_results]
+    if top_results and fetch_excerpts:
+        await _enrich_with_page_excerpts(top_results, person_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
     return top_results
 
 
@@ -1207,91 +2136,68 @@ def _build_strategies(
     if not clean_name:
         return []
 
-    name_clause = _quote_clause(clean_name)
-    institution_clause = _quote_clause(clean_institution)
-    institution_fragment = institution_clause or clean_institution
-
-    # Increased limits to ensure we capture true positives
-    base_limit = max(4, min(6, per_strategy_limit))
+    # Increased limits to ensure we capture true positives (fewer strategies, deeper depth)
+    base_limit = max(5, min(8, per_strategy_limit + 2))
 
     strategies: List[QueryStrategy] = [
-        # HIGHEST PRIORITY: Name + Institution combined (ensures both appear together)
+        # 1. Consolidated Basic (Catches general mentions)
+        # Unquoted name allows for variations (e.g. "E. M. Purcell" -> "Edward Mills Purcell")
+        # "Purdue University" is strong enough to anchor it.
         QueryStrategy(
-            name="name_institution_combined",
-            query=f"{name_clause} {institution_clause}",  # Both terms together
-            limit=base_limit + 3,  # Highest limit
-            boost=6,  # Highest boost - these are most relevant
-        ),
-        # Connection-focused search (looking for explicit relationships)
-        QueryStrategy(
-            name="explicit_connection",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                '("professor at" OR "faculty" OR "graduated from" OR "degree from" OR "alumnus" OR "worked at")',
-            ),
+            name="basic_consolidated",
+            query=f'{clean_name} {clean_institution}',
             limit=base_limit + 2,
             boost=5,
         ),
-        # Core profile search (general biographical info)
-        QueryStrategy(
-            name="core_profile",
-            query=_compose_query(name_clause, institution_fragment),
-            limit=base_limit + 1,
-            boost=4,
-        ),
-        # Current status (high value for current vs past determination)
-        QueryStrategy(
-            name="current_status",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                '("currently" OR "now" OR "presently")',
-            ),
-            limit=base_limit,
-            boost=3,
-        ),
-        # Career history (CV/bio pages are very informative)
-        QueryStrategy(
-            name="career_timeline",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                '("curriculum vitae" OR "cv" OR "biography")',
-            ),
-            limit=base_limit,
-            boost=3,
-        ),
-        # Education/degree search (important for alumni connections)
-        QueryStrategy(
-            name="education",
-            query=_compose_query(
-                name_clause,
-                institution_fragment,
-                '("degree" OR "graduated" OR "alumni" OR "PhD" OR "bachelor")',
-            ),
-            limit=base_limit,
-            boost=3,
-        ),
     ]
     
-    # Add directory search only if we have institution domain
+    # NEW: Relaxed Name Variation (e.g. "Ben R. Mottelson" -> "Ben Mottelson")
+    # This helps when the middle initial/name is present in input but missing in evidence
+    components = _extract_name_components(clean_name)
+    if components["first"] and components["last"] and (components["middle"] or components["initials"]):
+        relaxed_name = f"{components['first'][0]} {components['last'][0]}"
+        strategies.append(
+            QueryStrategy(
+                name="relaxed_name_variation",
+                # Use quoted relaxed name + institution to force exact match on the simplified name
+                query=f'"{relaxed_name}" {clean_institution}',
+                limit=base_limit,
+                boost=6,
+            )
+        )
+    
+    # 2. Site Search (Merged Unquoted/Quoted into one strong query)
     domain_guess = _institution_domain_guess(clean_institution)
     if domain_guess:
         site_filter = f"site:{domain_guess}"
         strategies.append(
             QueryStrategy(
-                name="directory",
-                query=_compose_query(
-                    name_clause,
-                    institution_fragment,
-                    site_filter,
-                    '("faculty" OR "staff" OR "directory")',
-                ),
-                limit=base_limit + 2,  # Higher for official pages
-                boost=5,  # Very high boost for official domain
+                name="site_consolidated",
+                query=f'"{clean_name}" {site_filter}',
+                limit=base_limit + 4,
+                boost=9, 
             )
         )
+        
+    # 3. Role & CV (Heavy hitting keywords for professional connection)
+    strategies.append(
+        QueryStrategy(
+            name="role_evidence",
+            query=f'"{clean_name}" {clean_institution} (professor OR faculty OR alumni OR resume OR CV OR visiting OR adjunct)',
+            limit=base_limit,
+            boost=8,
+        )
+    )
+    
+    # 4. Education & Early Career (Heavy hitting keywords for student/grad connection)
+    strategies.append(
+        QueryStrategy(
+            name="education_evidence",
+            query=f'"{clean_name}" {clean_institution} (degree OR B.S. OR B.A. OR PhD OR student OR graduated OR 19*)',
+            limit=base_limit,
+            boost=7,
+        )
+    )
 
     for index, strategy in enumerate(strategies):
         setattr(strategy, "order", index)
@@ -1407,11 +2313,13 @@ async def _execute_strategy(
     institution: str,
     person_name: str,
     debug: bool = False,
-    timeout: float = 20.0,
+    timeout: float = 45.0,
+    fetch_excerpts: bool = True,
+    ddg_min_results: int = 5,
 ) -> List[Dict[str, object]]:
     """Execute a single search strategy with reasonable timeout.
     
-    Timeout is generous (20s) to allow legitimate slow responses while still
+    Timeout is generous (45s) to allow legitimate slow responses while still
     preventing indefinite hangs. The real speedup comes from fewer strategies
     and early termination when we have good results.
     """
@@ -1434,6 +2342,9 @@ async def _execute_strategy(
     
     try:
         # Timeout is generous to avoid cutting off legitimate searches
+        # CRITICAL FIX: Re-enable DDG fallback for enhanced strategies
+        # When Bing returns garbage results (e.g., score=1 for all results),
+        # no amount of strategy variety will help - we need DDG as backup.
         results = await asyncio.wait_for(
             bing_search(
                 query,
@@ -1441,6 +2352,10 @@ async def _execute_strategy(
                 institution=institution,
                 person_name=clean_person,
                 debug=debug,
+                allow_fallback=True,  # Re-enable DDG fallback to rescue garbage Bing results
+                fetch_excerpts=fetch_excerpts,
+                ddg_min_results=ddg_min_results,
+                ensure_tokens=False,
             ),
             timeout=timeout
         )
@@ -1465,8 +2380,19 @@ async def _enhanced_search_impl(
     institution: str = "",
     num_results: int = 30,
     debug: bool = False,
+    dataset_profile: str = None,
+    fetch_excerpts: bool = True,
+    ddg_min_results: int = 5,
 ) -> List[Dict[str, object]]:
-    """Internal implementation of enhanced search without timeout wrapper."""
+    """Internal implementation of enhanced search without timeout wrapper.
+    
+    Args:
+        name: Person's name
+        institution: Institution to search for
+        num_results: Number of results to return
+        debug: Enable debug output
+        dataset_profile: Dataset profile ("high_connection" or "low_connection")
+    """
     clean_name = _normalise_whitespace(name)
     if not clean_name:
         return []
@@ -1481,14 +2407,31 @@ async def _enhanced_search_impl(
             institution=institution,
             person_name=clean_name,
             debug=debug,
+            fetch_excerpts=fetch_excerpts,
+            ddg_min_results=ddg_min_results,
         )
 
-    # Reduce concurrent strategies to 3 to avoid overwhelming slow connections
-    sem = asyncio.Semaphore(3)
+    # NEW: Get early-exit threshold based on dataset profile
+    from .config import get_early_exit_threshold
+    early_exit_threshold = get_early_exit_threshold(dataset_profile)
+    if debug:
+        print(f"[search] Early exit threshold: {early_exit_threshold} (profile: {dataset_profile or 'default'})")
+
+    # OPTIMIZATION: 4 concurrent strategies per name (matches consolidated list)
+    sem = asyncio.Semaphore(4)
 
     async def run(strategy: QueryStrategy) -> List[Dict[str, object]]:
         async with sem:
-            return await _execute_strategy(strategy, institution, clean_name, debug=debug, timeout=20.0)
+            # 60s timeout allows thorough searching
+            return await _execute_strategy(
+                strategy,
+                institution,
+                clean_name,
+                debug=debug,
+                timeout=60.0,
+                fetch_excerpts=fetch_excerpts,
+                ddg_min_results=ddg_min_results,
+            )
 
     tasks = [asyncio.create_task(run(strategy)) for strategy in strategies]
     combined: Dict[str, Dict[str, object]] = {}
@@ -1499,6 +2442,8 @@ async def _enhanced_search_impl(
     high_quality_threshold = 15  # relevance score for "high quality"
     
     completed_strategies = 0
+    successful_strategies = 0
+    
     for coro in asyncio.as_completed(tasks):
         try:
             payload = await coro
@@ -1508,6 +2453,8 @@ async def _enhanced_search_impl(
                 if debug:
                     print(f"[search] A strategy failed: {payload}")
                 continue
+            
+            successful_strategies += 1
             
             # Merge results from this strategy
             strategy_idx = None
@@ -1530,6 +2477,24 @@ async def _enhanced_search_impl(
             if debug and strategy:
                 print(f"[search] Completed '{strategy.name}' ({completed_strategies}/{len(strategies)}): {len(combined)} total results")
             
+            # NEW: Check for early exit (low-connection datasets)
+            # If first 2 SUCCESSFUL strategies return 0 results with score >= early_exit_threshold, exit
+            # We use successful_strategies instead of completed_strategies to avoid exiting if strategies fail
+            if successful_strategies >= 2 and dataset_profile and "low" in str(dataset_profile).lower():
+                high_score_results = [
+                    r for r in combined.values()
+                    if r["signals"].get("relevance_score", 0) >= early_exit_threshold
+                ]
+                if len(high_score_results) == 0:
+                    if debug:
+                        print(f"[search] Early exit: No high-quality results (>={early_exit_threshold}) after {successful_strategies} successful strategies")
+                    
+                    # Cancel remaining tasks
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    break
+            
             # Check for early termination: if we have enough high-quality results, stop waiting
             high_quality_results = [
                 r for r in combined.values()
@@ -1537,12 +2502,12 @@ async def _enhanced_search_impl(
             ]
             
             # Terminate early if:
-            # 1. We have at least threshold number of total results AND
-            # 2. At least half of them are high-quality AND
-            # 3. We've completed at least half the strategies (to ensure diversity)
-            if (len(combined) >= early_termination_threshold and 
-                len(high_quality_results) >= early_termination_threshold // 2 and
-                completed_strategies >= len(strategies) // 2):
+            # 1. We have at least 15 high-quality results OR
+            # 2. We have 10+ results with at least 5 high-quality ones
+            # 3. After completing at least 2-3 strategies (not 50%)
+            if (completed_strategies >= 2 and 
+                ((len(high_quality_results) >= 15) or 
+                 (len(combined) >= 10 and len(high_quality_results) >= 5))):
                 
                 if debug:
                     print(f"[search] Early termination: {len(combined)} results ({len(high_quality_results)} high-quality) after {completed_strategies}/{len(strategies)} strategies")
@@ -1590,7 +2555,8 @@ async def _enhanced_search_impl(
         # Boost reliable sources moderately
         reliable_sources = [
             "wikipedia.org", "britannica.com", "researchgate.net",
-            "semanticscholar.org", "scholar.google.com"
+            "semanticscholar.org", "scholar.google.com", "nobelprize.org",
+            "biography.com"
         ]
         if any(reliable in domain for reliable in reliable_sources):
             result["signals"]["relevance_score"] = result["signals"].get("relevance_score", 0) + 8
@@ -1617,16 +2583,19 @@ async def _enhanced_search_impl(
             institution=institution,
             person_name=clean_name,
             debug=debug,
+            fetch_excerpts=fetch_excerpts,
+            ddg_min_results=ddg_min_results,
         )
 
     top_results = ordered[:num_results]
     for idx, result in enumerate(top_results, start=1):
         result["rank"] = idx
-    await _enrich_with_page_excerpts(top_results, clean_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
+    if fetch_excerpts:
+        await _enrich_with_page_excerpts(top_results, clean_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
     return top_results
 
 
-ENHANCED_SEARCH_TIMEOUT = 45.0  # Maximum time for enhanced search to complete
+ENHANCED_SEARCH_TIMEOUT = 90.0  # Maximum time for enhanced search to complete
 
 
 async def enhanced_search(
@@ -1634,6 +2603,9 @@ async def enhanced_search(
     institution: str = "",
     num_results: int = 30,
     debug: bool = False,
+    dataset_profile: str = None,
+    fetch_excerpts: bool = True,
+    ddg_min_results: int = 5,
 ) -> List[Dict[str, object]]:
     """Execute enhanced search with timeout protection.
     
@@ -1643,7 +2615,15 @@ async def enhanced_search(
     """
     try:
         return await asyncio.wait_for(
-            _enhanced_search_impl(name, institution, num_results, debug),
+            _enhanced_search_impl(
+                name,
+                institution,
+                num_results,
+                debug,
+                dataset_profile,
+                fetch_excerpts,
+                ddg_min_results,
+            ),
             timeout=ENHANCED_SEARCH_TIMEOUT
         )
     except asyncio.TimeoutError:
@@ -1659,6 +2639,8 @@ async def enhanced_search(
             institution=institution,
             person_name=clean_name,
             debug=debug,
+            fetch_excerpts=fetch_excerpts,
+            ddg_min_results=ddg_min_results,
         )
 
 

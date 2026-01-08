@@ -129,6 +129,19 @@ This is particularly useful when working in notebooks where setting environment 
 
 The application will raise an error if the API key is not configured through either method.
 
+### VIP recall tuning
+
+If you need near-100% recall for high-value names (e.g., Nobel laureates), tune the following in `src/institution_checker/config.py`:
+
+- `VIP_NAMES`: Explicit list of names to always treat as VIPs (case-insensitive)
+- `VIP_SIGNAL_KEYWORDS`: Keywords in search results that trigger VIP handling (default includes `nobel`, `laureate`)
+- `VIP_ONLY_ENHANCED`: When true, only VIPs run enhanced search (faster for large batches)
+- `VIP_RESCUE_ENABLED`, `VIP_RESCUE_QUERIES`: Extra targeted queries to recover missed VIP connections
+- `LLM_EXCERPT_LIMIT`: Max pages to fetch for evidence before LLM (default 6)
+- `VIP_EXCERPT_LIMIT`: Higher excerpt fetch limit for VIPs (default 12)
+
+VIPs bypass LLM skip checks and force enhanced search to reduce false negatives.
+
 ## Command-line usage
 
 Run the CLI entry point:
