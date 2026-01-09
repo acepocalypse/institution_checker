@@ -1,9 +1,0 @@
-aiohttp
-beautifulsoup4
-httpx
-pandas
-pyppeteer
-
-[dev]
-ruff
-pytest
