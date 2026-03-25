@@ -170,6 +170,33 @@ _ATTENDED_TERMS = {
 _HONORARY_TERMS = ["honorary", "honoris causa"]
 
 
+def _coerce_message_text(value: Any) -> str:
+    """Coerce OpenAI-style message content/reasoning payloads into plain text.
+
+    Providers may return a string, list of content blocks, dict blocks, or None.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # Common block formats: {"text": ...}, {"content": ...}, {"output_text": ...}
+                text_part = item.get("text") or item.get("content") or item.get("output_text")
+                if text_part is not None:
+                    parts.append(_safe_text(text_part))
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        text_part = value.get("text") or value.get("content") or value.get("output_text")
+        if text_part is not None:
+            return _safe_text(text_part)
+    return _safe_text(value)
+
+
 def _extract_response_content(message: Dict[str, Any], debug: bool = False) -> tuple[Optional[str], Optional[str]]:
     """Extract content and reasoning from an LLM response message.
     
@@ -180,8 +207,10 @@ def _extract_response_content(message: Dict[str, Any], debug: bool = False) -> t
         - content: The final JSON output or answer
         - reasoning: The thinking/reasoning text (if present), None otherwise
     """
-    reasoning = message.get("reasoning", "")
-    content = message.get("content", "")
+    reasoning = _coerce_message_text(
+        message.get("reasoning") or message.get("reasoning_content")
+    )
+    content = _coerce_message_text(message.get("content"))
     
     if debug:
         print(f"[LLM PARSE] Message keys: {list(message.keys())}")
@@ -199,20 +228,16 @@ def _extract_response_content(message: Dict[str, Any], debug: bool = False) -> t
         
         # Try to find a JSON object in the reasoning text
         # Look for the final JSON block (it might contain thinking before it)
-        json_matches = list(re.finditer(r'\{[^{}]*"verdict"[^{}]*\}', reasoning, re.DOTALL))
-        
-        if json_matches:
-            # Take the last match (which is likely the final response)
-            final_match = json_matches[-1]
-            extracted_json = final_match.group(0)
-            
-            if debug:
-                print(f"[LLM PARSE] Extracted JSON from reasoning: {extracted_json[:100]}...")
-            
-            return extracted_json, reasoning
-        else:
-            if debug:
-                print(f"[LLM PARSE] No valid JSON object found in reasoning")
+        try:
+            extracted_json = _clean_json_blob(reasoning)
+            if extracted_json and extracted_json.strip().startswith("{"):
+                if debug:
+                    print(f"[LLM PARSE] Extracted JSON from reasoning: {extracted_json[:100]}...")
+                return extracted_json, reasoning
+        except Exception:
+            pass
+        if debug:
+            print(f"[LLM PARSE] No valid JSON object found in reasoning")
     
     # Normal case: return content as-is (either from non-thinking model or thinking model's final output)
     return content, reasoning if reasoning else None
@@ -1112,12 +1137,16 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
                 print("[LLM] Failed to parse server response as JSON")
             raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
         
-        # Defensive check: ensure data is a dict (not a list or other type)
+        # Defensive check: ensure data is a dict (not null/list/other type)
         if not isinstance(data, dict):
             if debug:
                 print(f"[LLM] ERROR: Response is not a dict, it's a {type(data).__name__}")
-                print(f"[LLM] Response content: {str(data)[:200]}")
-            raise RuntimeError(f"LLM response is not a JSON object: got {type(data).__name__}")
+                print(f"[LLM] Raw response text preview: {text[:200]}")
+            # Mark as transient to make upstream retries/logging clearer.
+            raise RuntimeError(
+                f"LLM response is not a JSON object: got {type(data).__name__}"
+                f" (raw_text={text[:80]!r})"
+            )
         
         # Debug: Print full API response structure
         if debug:
@@ -1130,7 +1159,13 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
                 print("[LLM] No choices in response")
             raise RuntimeError("LLM response contained no choices")
 
-        message = choices[0].get("message", {})
+        first_choice = choices[0] if choices else {}
+        if not isinstance(first_choice, dict):
+            raise RuntimeError(f"LLM choice is not a JSON object: got {type(first_choice).__name__}")
+
+        message = first_choice.get("message", {})
+        if not isinstance(message, dict):
+            raise RuntimeError(f"LLM message is not a JSON object: got {type(message).__name__}")
         
         # Debug: Print the entire message structure
         if debug:

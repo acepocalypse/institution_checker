@@ -45,7 +45,7 @@ PARTIAL_RESULTS_PATH = "data/results_partial.csv"
 INTER_BATCH_DELAY = 0.5  # seconds between batches
 NAME_TIMEOUT = 240.0  # maximum time allowed per name (balanced for accuracy)
 SEARCH_TIMEOUT = 180.0  # maximum time for search phase (restored for better accuracy)
-MAX_CONCURRENT_LLM_CALLS = 10  # limit concurrent LLM API calls (reduced for stability)
+MAX_CONCURRENT_LLM_CALLS = int(os.getenv("INSTITUTION_CHECKER_MAX_CONCURRENT_LLM", "6"))  # tune down by default for API stability
 MAX_CONCURRENT_SEARCHES = 8  # limit concurrent searches (increased to 8 for throughput)
 
 STRONG_POSITIVE_SIGNAL_KEYWORDS: List[str] = [
