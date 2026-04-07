@@ -4,9 +4,11 @@ import random
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 import pandas as pd
 from tqdm.auto import tqdm  # Auto-detects Jupyter notebooks vs terminal
@@ -19,6 +21,18 @@ from .config import (
     INSTITUTION,
     JOINT_CAMPUS_PATTERNS,
     LLM_EXCERPT_LIMIT,
+    PRE_LLM_SURVEY_ENABLE_BORDERLINE_RESCUE,
+    PRE_LLM_SURVEY_ENABLED,
+    PRE_LLM_SURVEY_HARD_NO_THRESHOLD,
+    PRE_LLM_SURVEY_HARD_NO_THRESHOLD_LOW_CONNECTION,
+    PRE_LLM_SURVEY_LOW_CONNECTION_MIN_RELEVANCE_FOR_ESCALATION,
+    PRE_LLM_SURVEY_LOW_CONNECTION_REQUIRE_STRONG_DOMAIN,
+    PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD,
+    PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD_LOW_CONNECTION,
+    PRE_LLM_SURVEY_RESCUE_NUM_RESULTS,
+    PRE_LLM_SURVEY_RESCUE_QUERY_TEMPLATE,
+    PRE_LLM_SURVEY_TRI_STATE,
+    PRE_LLM_SURVEY_VIP_BYPASS,
     VIP_EXCERPT_LIMIT,
     VIP_NAMES,
     VIP_ONLY_ENHANCED,
@@ -29,6 +43,7 @@ from .config import (
 )
 from .llm_processor import analyze_connection, close_session, refresh_session, _build_error, _safe_text
 from .search import (
+    ValidationSearchContext,
     bing_search,
     close_search_clients,
     enhanced_search,
@@ -36,6 +51,9 @@ from .search import (
     enrich_with_page_excerpts,
     force_browser_recreation,
     _fix_text_encoding,
+    validation_basic_search,
+    validation_enhanced_search,
+    validation_search_query,
 )
 
 DEFAULT_BATCH_SIZE = 20
@@ -44,9 +62,11 @@ RESULTS_PATH = "data/results.csv"
 PARTIAL_RESULTS_PATH = "data/results_partial.csv"
 INTER_BATCH_DELAY = 0.5  # seconds between batches
 NAME_TIMEOUT = 240.0  # maximum time allowed per name (balanced for accuracy)
-SEARCH_TIMEOUT = 180.0  # maximum time for search phase (restored for better accuracy)
+SEARCH_TIMEOUT = 180.0  # accuracy-friendly search timeout; avoid premature cutoff of difficult names
 MAX_CONCURRENT_LLM_CALLS = int(os.getenv("INSTITUTION_CHECKER_MAX_CONCURRENT_LLM", "6"))  # tune down by default for API stability
-MAX_CONCURRENT_SEARCHES = 8  # limit concurrent searches (increased to 8 for throughput)
+MAX_CONCURRENT_SEARCHES = 16  # higher search parallelism for low-connection bulk runs
+SEARCH_JITTER_MIN = 0.05
+SEARCH_JITTER_MAX = 0.25
 
 STRONG_POSITIVE_SIGNAL_KEYWORDS: List[str] = [
     "faculty",
@@ -129,6 +149,51 @@ HIGH_AUTHORITY_PATH_HINTS = [
     "/profile/",
 ]
 
+SURVEY_HARD_NO = "hard_no"
+SURVEY_BORDERLINE = "borderline"
+SURVEY_PLAUSIBLE = "plausible"
+
+SURVEY_STAGE_REJECT_FAST = "reject_fast"
+SURVEY_STAGE_REJECT_AFTER_RESCUE = "reject_after_rescue"
+SURVEY_STAGE_RESCUE_CANDIDATE = "rescue_candidate"
+SURVEY_STAGE_PASS_STRONG = "pass_strong"
+SURVEY_STAGE_PASS_AFTER_RESCUE = "pass_after_rescue"
+SURVEY_STAGE_PASS_WEAK = "pass_weak"
+
+SURVEY_REASON_SUMMARIES = {
+    "survey_disabled": "Pre-LLM survey disabled",
+    "vip_bypass": "VIP bypass kept this name eligible for LLM review",
+    "no_results": "No search results found",
+    "explicit_connection": "Explicit connection language found in search results",
+    "authoritative_institution_page": "Authoritative institution page found",
+    "institution_domain_hit": "Institution domain hit found",
+    "edu_signal": "Educational domain evidence found",
+    "multi_result_support": "Multiple supporting search results found",
+    "person_institution_match": "Person and institution co-occur in results",
+    "strong_relevance": "High relevance score found",
+    "joint_campus_only": "Only joint-campus evidence was found",
+    "weak_institution_evidence": "Institution evidence is weak",
+    "dominant_negative_signals": "Negative context dominates results",
+    "non_affiliation_shape": "Results look like celebrity or media coverage rather than institutional affiliation",
+    "weak_profile_anchor": "Person-specific Purdue profile evidence exists but wording is sparse",
+    "historical_anchor": "Direct historical role, degree, or training evidence was found",
+    "legacy_positive_shape": "Historical or indirect evidence still shows a plausible Purdue connection",
+    "low_authority_sources": "Only weak sources support the match",
+    "rescue_query_promoted": "Rescue query found additional institutional evidence",
+    "rescue_query_failed": "Rescue query did not improve evidence quality",
+    "low_connection_strict_gate": "Low-connection profile requires stronger authoritative evidence",
+}
+
+
+@dataclass(frozen=True)
+class PreLlmSurveyDecision:
+    bucket: str
+    score: int
+    reason_codes: Tuple[str, ...]
+    summary: str
+    used_rescue_query: bool = False
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
 
 class NameProcessingTimeout(Exception):
     """Raised when processing a single name exceeds the allowed timeout."""
@@ -137,6 +202,42 @@ class NameProcessingTimeout(Exception):
         super().__init__(f"Timed out processing '{name}' after {timeout:.0f}s")
         self.name = name
         self.timeout = timeout
+
+
+def _is_low_connection_profile(profile: Optional[str]) -> bool:
+    effective = (profile or DATASET_PROFILE or "").lower()
+    return "low" in effective
+
+
+def _profile_survey_thresholds(profile: Optional[str]) -> tuple[int, int]:
+    if _is_low_connection_profile(profile):
+        return (
+            PRE_LLM_SURVEY_HARD_NO_THRESHOLD_LOW_CONNECTION,
+            PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD_LOW_CONNECTION,
+        )
+    return (PRE_LLM_SURVEY_HARD_NO_THRESHOLD, PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD)
+
+
+def _classify_pre_llm_stage(
+    bucket: str,
+    metrics: Dict[str, Any],
+    *,
+    used_rescue_query: bool,
+) -> str:
+    if bucket == SURVEY_HARD_NO:
+        return SURVEY_STAGE_REJECT_AFTER_RESCUE if used_rescue_query else SURVEY_STAGE_REJECT_FAST
+    if bucket == SURVEY_BORDERLINE:
+        return SURVEY_STAGE_RESCUE_CANDIDATE
+
+    if used_rescue_query:
+        return SURVEY_STAGE_PASS_AFTER_RESCUE
+
+    strong_evidence = (
+        metrics.get("explicit_connection_hits", 0) > 0
+        or metrics.get("authoritative_institution_hits", 0) > 0
+        or metrics.get("purdue_domain_hits", 0) > 0
+    )
+    return SURVEY_STAGE_PASS_STRONG if strong_evidence else SURVEY_STAGE_PASS_WEAK
 
 
 def load_names(path: str) -> List[str]:
@@ -158,6 +259,15 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(directory, exist_ok=True)
 
 
+def _select_ddg_min_results(dataset_profile: str = None, *, vip_name: bool = False) -> int:
+    effective_profile = dataset_profile or DATASET_PROFILE
+    if vip_name:
+        return DDG_MIN_RESULTS_VIP
+    if effective_profile == "low_connection":
+        return DDG_MIN_RESULTS_LOW_CONNECTION
+    return DDG_MIN_RESULTS_DEFAULT
+
+
 async def process_name_search(name: str, use_enhanced_search: bool, debug: bool = False, dataset_profile: str = None) -> tuple[str, List[Dict[str, Any]]]:
     """Phase 1: Perform search for a name and return results.
     
@@ -165,185 +275,31 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
     strategies are slow. This prevents one slow search from blocking the entire batch.
     """
     search_start = time.time()
-    vip_name = _is_vip_name(name)
-    effective_profile = dataset_profile or DATASET_PROFILE
-    if vip_name:
-        ddg_min_results = DDG_MIN_RESULTS_VIP
-    elif effective_profile == "low_connection":
-        ddg_min_results = DDG_MIN_RESULTS_LOW_CONNECTION
-    else:
-        ddg_min_results = DDG_MIN_RESULTS_DEFAULT
     
     print(f"[PROGRESS] Starting search for: {name}")
     
     async def _do_search() -> tuple[str, List[Dict[str, Any]]]:
-        """Inner function that performs the actual search."""
+        """Inner function that performs the staged production search."""
         try:
-            # Cascading search strategy (OPTIMIZATION: try basic first to reduce redundancy)
-            allow_enhanced = use_enhanced_search and (vip_name or not VIP_ONLY_ENHANCED)
-            force_enhanced = allow_enhanced or vip_name
-            if force_enhanced:
-                if vip_name:
-                    print(f"[PROGRESS] VIP override: forcing enhanced search for {name}")
-                    results = await enhanced_search(
-                        name,
-                        INSTITUTION,
-                        num_results=40,
-                        debug=debug,
-                        dataset_profile=effective_profile,
-                        fetch_excerpts=False,
-                        ddg_min_results=ddg_min_results,
-                    )
-                    search_elapsed = time.time() - search_start
-                    print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
-                    if not results:
-                        print(f"[WARN] No search results found for {name}")
-                    return name, results
-                # Try basic search first - use flexible query without over-quoting
-                # Request 20 results so after filtering/extraction we get ~15 for LLM
-                # OPTIMIZATION: Unquote institution to find "Purdue" or "Purdue Univ" variants
-                query = f'{name} {INSTITUTION}'
-                print(f"[PROGRESS] Name: '{name}' | Query: '{query}'")
-                results = await bing_search(
-                    query,
-                    institution=INSTITUTION,
-                    person_name=name,
-                    num_results=20,
-                    debug=debug,
-                    fetch_excerpts=False,
-                    ddg_min_results=ddg_min_results,
-                )
-                
-                # If we got results, show what they are
-                if results:
-                    print(f"[PROGRESS] Result sample: {results[0]['title'][:80] if results[0].get('title') else 'N/A'}")
-                
-                # OPTIMIZATION: Check for name variations if strict search failed
-                # e.g. "Ben R. Mottelson" might fail, but "Ben Mottelson" might succeed
-                if not results and len(name.split()) > 2:
-                    parts = name.split()
-                    # Construct relaxed name (First + Last)
-                    relaxed_name = f"{parts[0]} {parts[-1]}"
-                    relaxed_query = f'{relaxed_name} {INSTITUTION}'
-                    print(f"[PROGRESS] Strict search failed. Trying relaxed query: '{relaxed_query}'")
-                    
-                    try:
-                        results = await bing_search(
-                            relaxed_query,
-                            institution=INSTITUTION,
-                            person_name=relaxed_name,
-                            num_results=20,
-                            debug=debug,
-                            fetch_excerpts=False,
-                            ddg_min_results=ddg_min_results,
-                        )
-                        if results:
-                            print(f"[PROGRESS] Relaxed search found {len(results)} results")
-                    except Exception as e:
-                        print(f"[WARN] Relaxed search failed: {e}")
-                
-                # OPTIMIZATION: "Quick Site Check" fallback for stubborn negatives
-                # If both strict and relaxed basic searches failed (0 results), try ONE targeted site search.
-                # This is much faster than full enhanced_search but safer than giving up immediately.
-                if not results:
-                    from .search import _institution_domain_guess
-                    domain = _institution_domain_guess(INSTITUTION) or "purdue.edu"
-                    site_query = f'site:{domain} "{name}"'
-                    print(f"[PROGRESS] Basic search failed. Last resort quick check: '{site_query}'")
-                    try:
-                        results = await bing_search(
-                            site_query,
-                            institution=INSTITUTION,
-                            person_name=name,
-                            num_results=10,
-                            debug=debug,
-                            fetch_excerpts=False,
-                            ddg_min_results=ddg_min_results,
-                        )
-                        if results:
-                            print(f"[PROGRESS] Quick site check found {len(results)} results")
-                    except Exception as e:
-                        print(f"[WARN] Quick site check failed: {e}")
-
-                # If basic search returns very few results OR low quality results, escalate to enhanced
-                # Enhanced search tries multiple query strategies to catch real connections
-                max_score = max((r.get('signals', {}).get('relevance_score', 0) for r in results), default=0)
-                
-                should_escalate = False
-                if len(results) < 5:
-                    should_escalate = True
-                if max_score < 5:
-                    should_escalate = True
-                
-                # Check for VIP/critical keywords in basic results that should force escalation
-                has_vip_signals = _has_vip_signals(results)
-
-                # NOTE: Removed "Strong Match Skip" optimization because it caused false negatives
-                # (e.g. Wolfgang Pauli found only a library book with high score, failing LLM check).
-                # We need Deep Search to find the *relationship* evidence (e.g. "Visiting Professor").
-
-                # Force enhanced search for high_connection profile to ensure max recall
-                # CRITICAL OPTIMIZATION: Smart Escalation
-                # Only run expensive enhanced search if there is a REASON to suspect a connection.
-                # If basic search found essentially nothing (Score < 8) and no keywords, trust the negative.
-                if effective_profile == "high_connection":
-                     # Condition 1: Critical keywords found (ALWAYS escalate)
-                     if has_vip_signals:
-                         should_escalate = True
-                     
-                     # Condition 2: Decent relevance score (likely a name match at the institution)
-                     elif max_score >= 8:
-                         should_escalate = True
-                         
-                     # Condition 3: Basic search failure (0 results or very weak noise) -> DO NOT ESCALATE
-                     # This is the massive speed win for the 95% of random names.
-                     else:
-                         if debug:
-                             print(f"[OPTIMIZATION] Skipping enhanced search (Max Score {max_score} < 8, No Keywords). Trusting negative.")
-                         should_escalate = False
-
-                # OPTIMIZATION for low_connection:
-                # If basic search found very few results, it's very likely a true negative.
-                # Don't waste time on enhanced search unless we have a reason to suspect a connection.
-                if effective_profile == "low_connection" and not has_vip_signals:
-                    if len(results) <= 1:
-                        print(f"[OPTIMIZATION] Basic search found <= 1 result. Skipping enhanced search (low_connection profile).")
-                        should_escalate = False
-                    elif len(results) <= 3 and max_score < 5:
-                        print(f"[OPTIMIZATION] Basic search found weak results (count={len(results)}, score={max_score}). Skipping enhanced search.")
-                        should_escalate = False
-                
-                if should_escalate:
-                    reason = "few results" if len(results) < 5 else f"low quality (max_score={max_score})"
-                    if allow_enhanced or has_vip_signals:
-                        print(f"[PROGRESS] Basic search returned {len(results)} results, {reason}, escalating to enhanced search...")
-                        results = await enhanced_search(
-                            name,
-                            INSTITUTION,
-                            num_results=30,
-                            debug=debug,
-                            dataset_profile=effective_profile,
-                            fetch_excerpts=False,
-                            ddg_min_results=ddg_min_results,
-                        )
-                    else:
-                        print(f"[PROGRESS] Skipping enhanced search (non-VIP fast path).")
-                else:
-                    print(f"[PROGRESS] Basic search returned {len(results)} results with max_score={max_score}, sufficient for analysis")
-            else:
-                query = f'{name} {INSTITUTION}'
-                results = await bing_search(
-                    query,
-                    institution=INSTITUTION,
-                    person_name=name,
-                    num_results=25,
-                    debug=debug,
-                    fetch_excerpts=False,
-                    ddg_min_results=ddg_min_results,
-                )
+            allow_recovery_fallback = _should_allow_slow_recovery_fallback(name)
+            allow_enhanced = use_enhanced_search and (_is_vip_name(name) or not VIP_ONLY_ENHANCED)
+            results, decision, metadata = await _run_staged_pre_llm_search(
+                name,
+                dataset_profile=dataset_profile,
+                debug=debug,
+                allow_enhanced=allow_enhanced,
+                allow_bing_recovery_fallback=allow_recovery_fallback,
+                allow_slow_ddg_recovery_fallback=allow_recovery_fallback,
+                cache_enabled=False,
+            )
             
             search_elapsed = time.time() - search_start
-            print(f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, found {len(results)} results")
+            print(
+                f"[PROGRESS] Search completed for {name} in {search_elapsed:.1f}s, "
+                f"found {len(results)} results "
+                f"(mode={metadata.get('search_mode_used')}, queries={metadata.get('network_queries_used')}, "
+                f"bucket={decision.bucket})"
+            )
             
             if not results:
                 print(f"[WARN] No search results found for {name}")
@@ -364,41 +320,476 @@ async def process_name_search(name: str, use_enhanced_search: bool, debug: bool 
         raise TimeoutError(f"Search exceeded {SEARCH_TIMEOUT}s timeout")
 
 
-async def process_name_llm(name: str, results: List[Dict[str, Any]], debug: bool = False, dataset_profile: str = None) -> Dict[str, str]:
+def _validation_positive_anchor_count(
+    metrics: Dict[str, Any],
+    reason_codes: Tuple[str, ...] | List[str],
+) -> int:
+    count = 0
+    if metrics.get("explicit_connection_hits", 0) > 0:
+        count += 1
+    if metrics.get("weak_profile_anchor_hits", 0) > 0:
+        count += 1
+    if metrics.get("authoritative_institution_hits", 0) > 0:
+        count += 1
+    if metrics.get("historical_role_anchor_hits", 0) > 0:
+        count += 1
+    if metrics.get("historical_education_anchor_hits", 0) > 0:
+        count += 1
+    if metrics.get("historical_profile_anchor_hits", 0) > 0:
+        count += 1
+    if (
+        metrics.get("person_institution_hits", 0) >= 3
+        and metrics.get("purdue_domain_hits", 0) >= 1
+        and (
+            metrics.get("weak_profile_anchor_hits", 0) > 0
+            or metrics.get("authoritative_institution_hits", 0) > 0
+            or metrics.get("explicit_connection_hits", 0) > 0
+            or metrics.get("historical_role_anchor_hits", 0) > 0
+            or metrics.get("historical_education_anchor_hits", 0) > 0
+        )
+    ):
+        count += 1
+    if "legacy_positive_shape" in reason_codes:
+        count += 1
+    return count
+
+
+def _has_historical_anchor_metrics(metrics: Dict[str, Any]) -> bool:
+    return any(
+        metrics.get(key, 0) > 0
+        for key in (
+            "historical_role_anchor_hits",
+            "historical_education_anchor_hits",
+            "historical_profile_anchor_hits",
+        )
+    )
+
+
+def classify_validation_borderline(
+    name: str,
+    decision: PreLlmSurveyDecision,
+) -> tuple[str, str]:
+    metrics = decision.metrics or {}
+    reason_codes = tuple(decision.reason_codes)
+    if decision.bucket != SURVEY_BORDERLINE:
+        if decision.bucket == SURVEY_PLAUSIBLE:
+            return "already_plausible", "already_plausible"
+        return "hard_no", "hard_no"
+
+    positive_anchor_count = _validation_positive_anchor_count(metrics, reason_codes)
+    negative_shape = metrics.get("negative_shape_hits", 0) > 0
+    historical_anchor = _has_historical_anchor_metrics(metrics)
+
+    if "legacy_positive_shape" in reason_codes:
+        return "borderline_likely_positive", "legacy_positive_shape"
+    if historical_anchor:
+        return "borderline_likely_positive", "historical_anchor"
+    if metrics.get("explicit_connection_hits", 0) > 0:
+        return "borderline_likely_positive", "explicit_connection"
+    if metrics.get("weak_profile_anchor_hits", 0) > 0:
+        return "borderline_likely_positive", "weak_profile_anchor"
+    if metrics.get("authoritative_institution_hits", 0) > 0:
+        return "borderline_likely_positive", "authoritative_profile"
+    if (
+        metrics.get("person_institution_hits", 0) >= 3
+        and metrics.get("purdue_domain_hits", 0) >= 1
+        and positive_anchor_count >= 1
+    ):
+        return "borderline_likely_positive", "strong_person_purdue_overlap"
+    if negative_shape and positive_anchor_count == 0:
+        return "borderline_low_signal", "negative_shape_without_anchor"
+    return "borderline_low_signal", "low_signal_borderline"
+
+
+def should_attempt_validation_rescue(
+    name: str,
+    decision: PreLlmSurveyDecision,
+) -> tuple[bool, str, str]:
+    subtype, reason = classify_validation_borderline(name, decision)
+    if subtype == "borderline_likely_positive":
+        return True, reason, subtype
+    return False, reason, subtype
+
+
+def should_attempt_validation_enhanced(
+    name: str,
+    decision: PreLlmSurveyDecision,
+) -> tuple[bool, str, str]:
+    metrics = decision.metrics or {}
+    subtype, _ = classify_validation_borderline(name, decision)
+    if decision.bucket == SURVEY_PLAUSIBLE:
+        return False, "already_plausible", subtype
+    if decision.bucket != SURVEY_BORDERLINE:
+        if metrics.get("explicit_connection_hits", 0) > 0:
+            return True, "explicit_connection_without_promotion", "borderline_likely_positive"
+        if metrics.get("weak_profile_anchor_hits", 0) > 0:
+            return True, "weak_profile_anchor", "borderline_likely_positive"
+        if _has_historical_anchor_metrics(metrics):
+            return True, "historical_anchor_without_promotion", "borderline_likely_positive"
+        return False, "obvious_negative", subtype
+    if metrics.get("negative_shape_hits", 0) > 0 and metrics.get("explicit_connection_hits", 0) == 0:
+        if not _has_historical_anchor_metrics(metrics):
+            return False, "negative_shape_post_rescue", subtype
+    if subtype == "borderline_likely_positive":
+        if metrics.get("explicit_connection_hits", 0) > 0:
+            return True, "explicit_connection", subtype
+        if metrics.get("weak_profile_anchor_hits", 0) > 0:
+            return True, "weak_profile_anchor", subtype
+        if metrics.get("authoritative_institution_hits", 0) > 0:
+            return True, "authoritative_profile", subtype
+        if _has_historical_anchor_metrics(metrics):
+            return True, "historical_anchor", subtype
+        if "legacy_positive_shape" in decision.reason_codes:
+            return True, "legacy_positive_shape", subtype
+    return False, "borderline_low_signal", subtype
+
+
+def _should_demote_validation_borderline_to_hard_no(
+    name: str,
+    decision: PreLlmSurveyDecision,
+    borderline_subtype: str,
+    dataset_profile: str = None,
+) -> bool:
+    if not _is_low_connection_profile(dataset_profile):
+        return False
+    metrics = decision.metrics or {}
+    if decision.bucket != SURVEY_BORDERLINE:
+        return False
+    if borderline_subtype != "borderline_low_signal":
+        return False
+    if metrics.get("explicit_connection_hits", 0) > 0:
+        return False
+    if metrics.get("weak_profile_anchor_hits", 0) > 0:
+        return False
+    if metrics.get("authoritative_institution_hits", 0) > 0:
+        return False
+    if _has_historical_anchor_metrics(metrics):
+        return False
+    if metrics.get("negative_shape_hits", 0) > 0:
+        return True
+    if metrics.get("weak_institution_evidence"):
+        return True
+    return False
+
+
+def _should_allow_slow_recovery_fallback(name: str) -> bool:
+    return False
+
+
+def _merge_backend_labels(*labels: str) -> str:
+    return "|".join(sorted({label for label in labels if label}))
+
+
+def _finalize_search_metadata(
+    metadata: Dict[str, Any],
+    search_context: ValidationSearchContext,
+) -> Dict[str, Any]:
+    metadata["cache_hits_total"] = search_context.cache_hits
+    metadata["cache_misses_total"] = search_context.cache_misses
+    metadata["backend_hits_total"] = dict(search_context.backend_hits)
+    return metadata
+
+
+def _print_search_metadata_summary(prefix: str, metadata_items: List[Dict[str, Any]]) -> None:
+    if not metadata_items:
+        return
+    total = len(metadata_items)
+    rescue_count = sum(1 for item in metadata_items if item.get("rescue_attempted"))
+    enhanced_count = sum(1 for item in metadata_items if item.get("enhanced_escalated"))
+    slow_fallback_count = sum(
+        1
+        for item in metadata_items
+        if item.get("ddg_manual_retry_used") or item.get("ddg_browser_fallback_used") or item.get("bing_fallback_used")
+    )
+    total_queries = sum(int(item.get("network_queries_used", 0)) for item in metadata_items)
+    total_attempts = sum(int(item.get("network_attempt_count", 0)) for item in metadata_items)
+    avg_queries = total_queries / total if total else 0.0
+    avg_attempts = total_attempts / total if total else 0.0
+    print(
+        f"{prefix} Search telemetry: avg_queries={avg_queries:.2f}, avg_attempts={avg_attempts:.2f}, "
+        f"rescue={rescue_count}, enhanced={enhanced_count}, slow_fallback={slow_fallback_count}"
+    )
+
+
+async def _run_staged_pre_llm_search(
+    name: str,
+    *,
+    dataset_profile: str = None,
+    debug: bool = False,
+    allow_enhanced: bool = True,
+    allow_bing_recovery_fallback: bool = False,
+    allow_slow_ddg_recovery_fallback: bool = False,
+    cache_enabled: bool = False,
+    context: Optional[ValidationSearchContext] = None,
+) -> tuple[List[Dict[str, Any]], PreLlmSurveyDecision, Dict[str, Any]]:
+    search_total_start = time.time()
+    basic_elapsed = 0.0
+    rescue_elapsed = 0.0
+    enhanced_elapsed = 0.0
+
+    search_context = context or ValidationSearchContext(
+        cache_enabled=cache_enabled,
+        allow_bing_fallback=allow_bing_recovery_fallback,
+        allow_slow_ddg_fallback=allow_slow_ddg_recovery_fallback,
+    )
+
+    basic_start = time.time()
+    basic_results, basic_meta = await validation_basic_search(
+        name,
+        INSTITUTION,
+        debug=debug,
+        context=search_context,
+        allow_bing_fallback=False,
+        allow_slow_ddg_fallback=False,
+    )
+    empty_result_recovery_attempted = False
+    empty_result_recovery_succeeded = False
+    if not basic_results:
+        empty_result_recovery_attempted = True
+        recovery_context = ValidationSearchContext(
+            cache_enabled=False,
+            allow_bing_fallback=True,
+            allow_slow_ddg_fallback=True,
+        )
+        recovered_results, recovery_meta = await validation_basic_search(
+            name,
+            INSTITUTION,
+            debug=debug,
+            context=recovery_context,
+            allow_bing_fallback=True,
+            allow_slow_ddg_fallback=True,
+        )
+        basic_meta = {
+            "backend_used": _merge_backend_labels(
+                str(basic_meta.get("backend_used", "")),
+                str(recovery_meta.get("backend_used", "")),
+            ),
+            "cache_hit": bool(basic_meta.get("cache_hit", False)) and bool(recovery_meta.get("cache_hit", False)),
+            "network_queries_used": int(basic_meta.get("network_queries_used", 0)) + int(recovery_meta.get("network_queries_used", 0)),
+            "ddg_manual_retry_used": bool(basic_meta.get("ddg_manual_retry_used", False)) or bool(recovery_meta.get("ddg_manual_retry_used", False)),
+            "ddg_browser_fallback_used": bool(basic_meta.get("ddg_browser_fallback_used", False)) or bool(recovery_meta.get("ddg_browser_fallback_used", False)),
+            "bing_fallback_used": bool(basic_meta.get("bing_fallback_used", False)) or bool(recovery_meta.get("bing_fallback_used", False)),
+            "network_attempt_count": int(basic_meta.get("network_attempt_count", 0)) + int(recovery_meta.get("network_attempt_count", 0)),
+        }
+        if recovered_results:
+            basic_results = recovered_results
+            empty_result_recovery_succeeded = True
+    basic_elapsed = time.time() - basic_start
+
+    def _finalize_with_timing(meta: Dict[str, Any]) -> Dict[str, Any]:
+        total_elapsed = time.time() - search_total_start
+        meta["timing_basic_s"] = basic_elapsed
+        meta["timing_rescue_s"] = rescue_elapsed
+        meta["timing_enhanced_s"] = enhanced_elapsed
+        meta["timing_total_s"] = total_elapsed
+        return _finalize_search_metadata(meta, search_context)
+
+    decision = evaluate_pre_llm_survey(
+        basic_results,
+        dataset_profile=dataset_profile,
+        name=name,
+    )
+    current_results: List[Dict[str, Any]] = list(basic_results)
+    rescue_attempted = False
+    rescue_reason = "not_needed"
+    enhanced_reason = "not_evaluated"
+    borderline_subtype = classify_validation_borderline(name, decision)[0]
+
+    metadata: Dict[str, Any] = {
+        "search_mode_used": "basic_only",
+        "enhanced_escalated": False,
+        "rescue_attempted": False,
+        "basic_result_count": len(basic_results),
+        "final_result_count": len(current_results),
+        "escalation_reason": enhanced_reason,
+        "rescue_reason": rescue_reason,
+        "enhanced_reason": enhanced_reason,
+        "borderline_subtype": borderline_subtype,
+        "backend_used": str(basic_meta.get("backend_used", "ddg")),
+        "cache_hit": bool(basic_meta.get("cache_hit", False)),
+        "network_queries_used": int(basic_meta.get("network_queries_used", 0)),
+        "ddg_manual_retry_used": bool(basic_meta.get("ddg_manual_retry_used", False)),
+        "ddg_browser_fallback_used": bool(basic_meta.get("ddg_browser_fallback_used", False)),
+        "bing_fallback_used": bool(basic_meta.get("bing_fallback_used", False)),
+        "network_attempt_count": int(basic_meta.get("network_attempt_count", 0)),
+        "empty_result_recovery_attempted": empty_result_recovery_attempted,
+        "empty_result_recovery_succeeded": empty_result_recovery_succeeded,
+    }
+    if empty_result_recovery_succeeded:
+        metadata["search_mode_used"] = "basic_empty_recovered"
+
+    should_rescue = False
+    if PRE_LLM_SURVEY_ENABLE_BORDERLINE_RESCUE:
+        should_rescue, rescue_reason, borderline_subtype = should_attempt_validation_rescue(name, decision)
+    metadata["rescue_reason"] = rescue_reason
+    metadata["borderline_subtype"] = borderline_subtype
+
+    if should_rescue:
+        rescue_attempted = True
+        rescue_query = PRE_LLM_SURVEY_RESCUE_QUERY_TEMPLATE.format(name=name)
+        rescue_start = time.time()
+        rescue_results, rescue_meta = await validation_search_query(
+            rescue_query,
+            institution=INSTITUTION,
+            person_name=name,
+            limit=PRE_LLM_SURVEY_RESCUE_NUM_RESULTS,
+            debug=debug,
+            context=search_context,
+            prefer_backend="ddg",
+            allow_bing_fallback=False,
+            allow_slow_ddg_fallback=False,
+            ensure_tokens=False,
+        )
+        rescue_elapsed = time.time() - rescue_start
+        current_results = _dedupe_by_url(list(current_results) + list(rescue_results))
+        decision = evaluate_pre_llm_survey(
+            current_results,
+            dataset_profile=dataset_profile,
+            name=name,
+            used_rescue_query=True,
+        )
+        metadata.update(
+            {
+                "search_mode_used": "basic_plus_rescue",
+                "rescue_attempted": True,
+                "final_result_count": len(current_results),
+                "backend_used": _merge_backend_labels(
+                    str(metadata.get("backend_used", "")),
+                    str(rescue_meta.get("backend_used", "")),
+                ),
+                "cache_hit": bool(metadata.get("cache_hit", False)) and bool(rescue_meta.get("cache_hit", False)),
+                "network_queries_used": int(metadata.get("network_queries_used", 0)) + int(rescue_meta.get("network_queries_used", 0)),
+                "ddg_manual_retry_used": bool(metadata.get("ddg_manual_retry_used", False)) or bool(rescue_meta.get("ddg_manual_retry_used", False)),
+                "ddg_browser_fallback_used": bool(metadata.get("ddg_browser_fallback_used", False)) or bool(rescue_meta.get("ddg_browser_fallback_used", False)),
+                "bing_fallback_used": bool(metadata.get("bing_fallback_used", False)) or bool(rescue_meta.get("bing_fallback_used", False)),
+                "network_attempt_count": int(metadata.get("network_attempt_count", 0)) + int(rescue_meta.get("network_attempt_count", 0)),
+            }
+        )
+        borderline_subtype = classify_validation_borderline(name, decision)[0]
+        metadata["borderline_subtype"] = borderline_subtype
+    elif decision.bucket == SURVEY_BORDERLINE and PRE_LLM_SURVEY_ENABLE_BORDERLINE_RESCUE:
+        metadata["rescue_reason"] = rescue_reason or "borderline_without_positive_anchor"
+
+    if _should_demote_validation_borderline_to_hard_no(name, decision, borderline_subtype, dataset_profile):
+        demoted_metrics = dict(decision.metrics)
+        demoted_metrics["stage"] = SURVEY_STAGE_REJECT_AFTER_RESCUE if decision.used_rescue_query else SURVEY_STAGE_REJECT_FAST
+        decision = PreLlmSurveyDecision(
+            bucket=SURVEY_HARD_NO,
+            score=decision.score,
+            reason_codes=decision.reason_codes,
+            summary=decision.summary,
+            used_rescue_query=decision.used_rescue_query,
+            metrics=demoted_metrics,
+        )
+        metadata["search_mode_used"] = f"{metadata['search_mode_used']}_demoted" if metadata["search_mode_used"] != "basic_only" else "basic_only_demoted"
+        metadata["enhanced_reason"] = "demoted_low_signal_negative"
+        metadata["escalation_reason"] = "demoted_low_signal_negative"
+        metadata["final_result_count"] = len(current_results)
+        return current_results, decision, _finalize_with_timing(metadata)
+
+    should_escalate, enhanced_reason, borderline_subtype = should_attempt_validation_enhanced(name, decision)
+    metadata["enhanced_reason"] = enhanced_reason
+    metadata["escalation_reason"] = enhanced_reason
+    metadata["borderline_subtype"] = borderline_subtype
+
+    if not allow_enhanced or not should_escalate:
+        metadata["final_result_count"] = len(current_results)
+        return current_results, decision, _finalize_with_timing(metadata)
+
+    enhanced_start = time.time()
+    enhanced_results, enhanced_meta = await validation_enhanced_search(
+        name,
+        INSTITUTION,
+        debug=debug,
+        context=search_context,
+        allow_bing_fallback=allow_bing_recovery_fallback,
+        allow_slow_ddg_fallback=allow_slow_ddg_recovery_fallback,
+    )
+    enhanced_elapsed = time.time() - enhanced_start
+    merged_results = _dedupe_by_url(list(current_results) + list(enhanced_results))
+    final_decision = evaluate_pre_llm_survey(
+        merged_results,
+        dataset_profile=dataset_profile,
+        name=name,
+        used_rescue_query=decision.used_rescue_query,
+    )
+    metadata.update(
+        {
+            "search_mode_used": "basic_plus_rescue_plus_enhanced" if rescue_attempted else "basic_plus_enhanced",
+            "enhanced_escalated": True,
+            "final_result_count": len(merged_results),
+            "enhanced_reason": enhanced_reason,
+            "borderline_subtype": classify_validation_borderline(name, final_decision)[0],
+            "backend_used": _merge_backend_labels(
+                str(metadata.get("backend_used", "")),
+                str(enhanced_meta.get("backend_used", "")),
+            ),
+            "cache_hit": bool(metadata.get("cache_hit", False)) and bool(enhanced_meta.get("cache_hit", False)),
+            "network_queries_used": int(metadata.get("network_queries_used", 0)) + int(enhanced_meta.get("network_queries_used", 0)),
+            "ddg_manual_retry_used": bool(metadata.get("ddg_manual_retry_used", False)) or bool(enhanced_meta.get("ddg_manual_retry_used", False)),
+            "ddg_browser_fallback_used": bool(metadata.get("ddg_browser_fallback_used", False)) or bool(enhanced_meta.get("ddg_browser_fallback_used", False)),
+            "bing_fallback_used": bool(metadata.get("bing_fallback_used", False)) or bool(enhanced_meta.get("bing_fallback_used", False)),
+            "network_attempt_count": int(metadata.get("network_attempt_count", 0)) + int(enhanced_meta.get("network_attempt_count", 0)),
+        }
+    )
+    if _should_demote_validation_borderline_to_hard_no(
+        name,
+        final_decision,
+        metadata.get("borderline_subtype", ""),
+        dataset_profile,
+    ):
+        demoted_metrics = dict(final_decision.metrics)
+        demoted_metrics["stage"] = SURVEY_STAGE_REJECT_AFTER_RESCUE if final_decision.used_rescue_query else SURVEY_STAGE_REJECT_FAST
+        final_decision = PreLlmSurveyDecision(
+            bucket=SURVEY_HARD_NO,
+            score=final_decision.score,
+            reason_codes=final_decision.reason_codes,
+            summary=final_decision.summary,
+            used_rescue_query=final_decision.used_rescue_query,
+            metrics=demoted_metrics,
+        )
+        metadata["search_mode_used"] = f"{metadata['search_mode_used']}_demoted"
+        metadata["enhanced_reason"] = "demoted_low_signal_negative"
+        metadata["escalation_reason"] = "demoted_low_signal_negative"
+    return merged_results, final_decision, _finalize_with_timing(metadata)
+
+
+async def run_pre_llm_validation_search(
+    name: str,
+    *,
+    dataset_profile: str = None,
+    debug: bool = False,
+    allow_enhanced: bool = True,
+    allow_bing_fallback: bool = False,
+    allow_slow_ddg_fallback: bool = False,
+    cache_enabled: bool = True,
+    context: Optional[ValidationSearchContext] = None,
+) -> tuple[List[Dict[str, Any]], PreLlmSurveyDecision, Dict[str, Any]]:
+    return await _run_staged_pre_llm_search(
+        name,
+        dataset_profile=dataset_profile,
+        debug=debug,
+        allow_enhanced=allow_enhanced,
+        allow_bing_recovery_fallback=allow_bing_fallback,
+        allow_slow_ddg_recovery_fallback=allow_slow_ddg_fallback,
+        cache_enabled=cache_enabled,
+        context=context,
+    )
+
+
+async def process_name_llm(
+    name: str,
+    results: List[Dict[str, Any]],
+    debug: bool = False,
+    dataset_profile: str = None,
+    pre_llm_decision: Optional[PreLlmSurveyDecision] = None,
+) -> Dict[str, str]:
     """Phase 2: Analyze search results with LLM."""
     llm_start = time.time()
     print(f"[PROGRESS] Starting LLM analysis for: {name}")
     
     try:
         vip_mode = _is_vip_name(name) or _has_vip_signals(results)
-
-        # QUALITY CHECK: Count high-quality results before sending to LLM
-        # Use dynamic threshold based on dataset profile
-        from .config import get_skip_threshold
-        
-        # Determine threshold: use configured skip threshold
-        # FIX: For high_connection (threshold 0), use a lower floor (4) to capture weak signals like "Visiting Professor"
-        # For low_connection (threshold 8), keep the floor at 8 to filter garbage
-        configured_threshold = get_skip_threshold(dataset_profile)
-        if configured_threshold < 5:
-            threshold = 4
-        else:
-            threshold = max(8, configured_threshold)
-        
-        high_quality_count = sum(
-            1 for r in results 
-            if r.get('signals', {}).get('relevance_score', 0) >= threshold
-        )
-        
-        # If we have < 1 high-quality results after filtering, skip LLM call
-        # The LLM will receive "(no search results available)" which wastes API calls
-        if high_quality_count < 1 and not vip_mode:
-            print(f"[QUALITY-SKIP] Skipping LLM for {name}: only {high_quality_count} high-quality results (threshold: {threshold})")
-            return _build_immediate_not_connected(
-                name, 
-                INSTITUTION, 
-                f"Insufficient high-quality search results ({high_quality_count} results with score >= {threshold})"
-            )
 
         excerpt_limit = VIP_EXCERPT_LIMIT if vip_mode else LLM_EXCERPT_LIMIT
         if results and excerpt_limit > 0:
@@ -407,6 +798,7 @@ async def process_name_llm(name: str, results: List[Dict[str, Any]], debug: bool
         decision = await analyze_connection(name, INSTITUTION, results, debug=debug, vip_mode=vip_mode)
 
         if vip_mode and VIP_RESCUE_ENABLED and decision.get("verdict") != "connected":
+            ddg_min_results = DDG_MIN_RESULTS_VIP if vip_mode else DDG_MIN_RESULTS_DEFAULT
             rescue_results = await _vip_rescue_search(
                 name,
                 INSTITUTION,
@@ -437,7 +829,7 @@ async def process_name_llm(name: str, results: List[Dict[str, Any]], debug: bool
         
         payload = {"name": name, "institution": INSTITUTION}
         payload.update(decision)
-        return payload
+        return _apply_pre_llm_audit(payload, pre_llm_decision)
         
     except Exception as e:
         elapsed = time.time() - llm_start
@@ -454,9 +846,31 @@ async def process_name(name: str, use_enhanced_search: bool, debug: bool = False
     start = time.time()
     
     try:
-        # Use the split-phase approach for consistency
-        result_name, results = await process_name_search(name, use_enhanced_search, debug=debug, dataset_profile=dataset_profile)
-        decision = await process_name_llm(result_name, results, debug=debug, dataset_profile=dataset_profile)
+        allow_recovery_fallback = _should_allow_slow_recovery_fallback(name)
+        surveyed_results, survey_decision, _ = await _run_staged_pre_llm_search(
+            name,
+            dataset_profile=dataset_profile,
+            debug=debug,
+            allow_enhanced=use_enhanced_search and (_is_vip_name(name) or not VIP_ONLY_ENHANCED),
+            allow_bing_recovery_fallback=allow_recovery_fallback,
+            allow_slow_ddg_recovery_fallback=allow_recovery_fallback,
+            cache_enabled=False,
+        )
+        if survey_decision.bucket == SURVEY_HARD_NO:
+            return _build_immediate_not_connected(
+                name,
+                INSTITUTION,
+                survey_decision.summary,
+                pre_llm_decision=survey_decision,
+            )
+
+        decision = await process_name_llm(
+            name,
+            surveyed_results,
+            debug=debug,
+            dataset_profile=dataset_profile,
+            pre_llm_decision=survey_decision,
+        )
         
         payload = {"name": name, "institution": INSTITUTION}
         payload.update(decision)
@@ -487,7 +901,12 @@ async def _process_name_with_timeout(name: str, use_enhanced_search: bool, debug
         raise NameProcessingTimeout(name, NAME_TIMEOUT) from exc
 
 
-def _build_immediate_not_connected(name: str, institution: str, reason: str) -> Dict[str, str]:
+def _build_immediate_not_connected(
+    name: str,
+    institution: str,
+    reason: str,
+    pre_llm_decision: Optional[PreLlmSurveyDecision] = None,
+) -> Dict[str, str]:
     """Build an immediate 'not_connected' result without LLM call.
     
     Used ONLY for obvious cases where we can skip LLM to save API quota.
@@ -497,7 +916,7 @@ def _build_immediate_not_connected(name: str, institution: str, reason: str) -> 
     The conservative skip policy ensures we maintain 95%+ accuracy while
     still achieving scalability through batching and parallelization.
     """
-    return {
+    payload = {
         "name": name,
         "institution": institution,
         "verdict": "not_connected",
@@ -516,6 +935,7 @@ def _build_immediate_not_connected(name: str, institution: str, reason: str) -> 
         "supporting_url": "",
         "temporal_evidence": "N/A",
     }
+    return _apply_pre_llm_audit(payload, pre_llm_decision)
 
 
 def _aggregate_result_text(result: Dict[str, Any]) -> str:
@@ -667,6 +1087,944 @@ def _score_source_authority(url: str) -> Tuple[int, List[str]]:
     return score, factors
 
 
+def _result_has_degree_signal(text: str) -> bool:
+    degree_terms = (
+        "degree",
+        "graduated",
+        "graduate",
+        "phd",
+        "ph.d",
+        "doctorate",
+        "bachelor",
+        "master",
+        "student",
+        "attended",
+        "studied",
+        "coursework",
+    )
+    return any(term in text for term in degree_terms)
+
+
+_AUTHORITATIVE_PROFILE_PATH_HINTS = (
+    "/directory/",
+    "/people/",
+    "/faculty/",
+    "/staff/",
+    "/profiles/",
+    "/profile/",
+    "/alumni/",
+)
+
+_NON_PROFILE_PATH_HINTS = (
+    "/news",
+    "/newsroom",
+    "/releases",
+    "/events",
+    "/event",
+    "/calendar",
+    "/stories",
+    "/story",
+    "/article",
+    "/articles",
+    "/speaker",
+    "/speakers",
+    "/lecture",
+    "/lectures",
+    "/forum",
+    "/library",
+    "/discovery",
+    "/catalog",
+    "/search",
+    "/find",
+)
+
+_NON_AFFILIATION_URL_HINTS = (
+    "/news",
+    "/newsroom",
+    "/releases",
+    "/events",
+    "/event",
+    "/calendar",
+    "/stories",
+    "/story",
+    "/article",
+    "/articles",
+    "/speaker",
+    "/speakers",
+    "/lecture",
+    "/lectures",
+    "/forum",
+    "/sinai-forum",
+    "/presidential-lecture",
+    "/brand-studio",
+    "/marketing",
+    "/campaign",
+    "/feature",
+    "/features",
+    "/library",
+    "/discovery",
+    "/catalog",
+    "/search",
+    "/find",
+)
+
+_NON_AFFILIATION_TEXT_HINTS = (
+    "keynote",
+    "speaker",
+    "past speakers",
+    "lecture series",
+    "presidential lecture",
+    "forum",
+    "sinai forum",
+    "concert",
+    "festival",
+    "watch party",
+    "feature story",
+    "featured in",
+    "highlighted in",
+    "highlighted by",
+    "article about",
+    "story about",
+    "news story",
+    "campus article",
+    "campus feature",
+    "opinion column",
+    "pop culture column",
+    "tribute to",
+    "inspired by",
+    "themed",
+    "campaign",
+    "marketing",
+    "brand studio",
+    "case study",
+    "mentioned in",
+    "referenced in",
+    "book",
+    "catalog",
+    "discovery",
+    "library",
+    "biography of",
+)
+
+_PERSON_SPECIFIC_PATH_HINTS = (
+    "/directory/",
+    "/people/",
+    "/faculty/",
+    "/staff/",
+    "/profiles/",
+    "/profile/",
+    "/alumni/",
+    "/person/",
+)
+
+_DIRECT_CONNECTION_TERMS = (
+    "faculty",
+    "professor",
+    "assistant professor",
+    "associate professor",
+    "lecturer",
+    "instructor",
+    "staff",
+    "researcher",
+    "research scientist",
+    "research associate",
+    "director",
+    "dean",
+    "chair",
+    "president",
+    "provost",
+    "chancellor",
+    "executive",
+    "postdoc",
+    "postdoctoral",
+    "visiting professor",
+    "visiting scholar",
+    "visiting fellow",
+    "alumni",
+    "alumnus",
+    "alumna",
+    "alum",
+    "student at",
+    "studied at",
+    "attended",
+    "graduated from",
+    "degree from",
+    "earned degree",
+    "earned a",
+    "earned an",
+    "phd from",
+    "ph.d. from",
+)
+
+_AUTHORITATIVE_AFFILIATION_TERMS = (
+    "faculty",
+    "professor",
+    "staff",
+    "researcher",
+    "directory",
+    "profile",
+    "alumni",
+    "alumnus",
+    "alumna",
+    "student",
+    "postdoc",
+    "postdoctoral",
+    "visiting professor",
+    "visiting scholar",
+    "emeritus",
+    "dean",
+    "director",
+    "chair",
+)
+
+
+def _is_non_profile_page(url: str) -> bool:
+    return any(hint in url for hint in _NON_PROFILE_PATH_HINTS)
+
+
+def _looks_like_generic_profile_query_page(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    path = (parsed.path or "").lower().rstrip("/")
+    query = (parsed.query or "").lower()
+    generic_paths = {
+        "",
+        "/",
+        "/directory",
+        "/people",
+        "/faculty",
+        "/staff",
+        "/profiles",
+        "/profile",
+    }
+    if path in generic_paths:
+        return True
+    if any(token in query for token in ("search=", "query=", "searchstring=", "q=")):
+        return True
+    return False
+
+
+def _is_non_main_purdue_context(url: str) -> bool:
+    lowered = _safe_text(url).lower()
+    return any(token in lowered for token in ("pnw.edu", "purdueglobal.edu", "global.purdue.edu"))
+
+
+def _looks_like_non_affiliation_result(result: Dict[str, Any]) -> bool:
+    url = _safe_text(result.get("url", "")).lower()
+    text = _aggregate_result_text(result).lower()
+
+    if _is_non_main_purdue_context(url):
+        return True
+    if any(hint in url for hint in _NON_AFFILIATION_URL_HINTS):
+        return True
+    return any(term in text for term in _NON_AFFILIATION_TEXT_HINTS)
+
+
+def _has_person_specific_profile_anchor(result: Dict[str, Any]) -> bool:
+    url = _safe_text(result.get("url", "")).lower()
+    if "purdue.edu" not in url or _is_non_main_purdue_context(url):
+        return False
+    if _is_non_profile_page(url) or _looks_like_non_affiliation_result(result):
+        return False
+    if _looks_like_generic_profile_query_page(url):
+        return False
+
+    signals = result.get("signals") or {}
+    confidence = signals.get("person_match_confidence")
+    if confidence == "url":
+        return True
+
+    return any(hint in url for hint in _PERSON_SPECIFIC_PATH_HINTS)
+
+
+def _is_profile_like_result(result: Dict[str, Any]) -> bool:
+    url = _safe_text(result.get("url", "")).lower()
+    if "purdue.edu" not in url or _is_non_main_purdue_context(url):
+        return False
+    if _is_non_profile_page(url) or _looks_like_non_affiliation_result(result):
+        return False
+
+    title = _safe_text(result.get("title", "")).lower()
+    snippet = _safe_text(result.get("snippet", "")).lower()
+    text = f"{title} {snippet}"
+
+    if _has_person_specific_profile_anchor(result):
+        return True
+
+    profile_terms = (
+        "directory",
+        "profile",
+        "faculty",
+        "staff",
+        "alumni",
+        "people",
+        "biography",
+        "curriculum vitae",
+        "cv",
+    )
+    return any(term in text for term in profile_terms) and (
+        (result.get("signals") or {}).get("person_match_confidence") == "url"
+    )
+
+
+def _result_has_direct_connection_family(result: Dict[str, Any]) -> bool:
+    text = _aggregate_result_text(result)
+    url = _safe_text(result.get("url", "")).lower()
+    content_text = " ".join(
+        _safe_text(result.get(field, ""))
+        for field in ("title", "snippet", "page_excerpt", "description")
+    ).lower()
+    lowered = content_text
+    signals = result.get("signals") or {}
+    has_historical_role_anchor = bool(signals.get("has_historical_role_anchor"))
+    has_historical_education_anchor = bool(signals.get("has_historical_education_anchor"))
+
+    if signals.get("has_event_prize_pattern"):
+        return False
+    if (
+        _looks_like_non_affiliation_result(result)
+        and not _has_person_specific_profile_anchor(result)
+        and not has_historical_role_anchor
+        and not has_historical_education_anchor
+    ):
+        return False
+    if (
+        _is_non_profile_page(url)
+        and not _is_profile_like_result(result)
+        and not has_historical_role_anchor
+        and not has_historical_education_anchor
+    ):
+        return False
+    if not signals.get("has_person_name") or not signals.get("has_institution"):
+        return False
+
+    if has_historical_role_anchor or has_historical_education_anchor:
+        return True
+
+    has_direct_terms = any(term in lowered for term in _DIRECT_CONNECTION_TERMS)
+    has_degree_signal = _result_has_degree_signal(lowered)
+    strong_page_context = _has_person_specific_profile_anchor(result)
+
+    if has_direct_terms and (
+        strong_page_context
+        or (signals.get("has_explicit_connection") and (signals.get("has_academic_role") or has_degree_signal))
+    ):
+        return True
+
+    if signals.get("has_explicit_connection") and (
+        signals.get("has_academic_role") or has_degree_signal
+    ):
+        return True
+
+    return False
+
+
+def _result_supports_corroboration(result: Dict[str, Any]) -> bool:
+    signals = result.get("signals") or {}
+    if not signals.get("has_person_name") or not signals.get("has_institution"):
+        return False
+    if signals.get("has_event_prize_pattern"):
+        return False
+    if _looks_like_non_affiliation_result(result) and not _has_person_specific_profile_anchor(result):
+        if not signals.get("has_historical_role_anchor") and not signals.get("has_historical_education_anchor"):
+            return False
+    if _result_has_direct_connection_family(result):
+        return True
+    if _is_profile_like_result(result):
+        return True
+    if signals.get("has_historical_profile_anchor"):
+        return True
+
+    relevance = int(signals.get("relevance_score", 0) or 0)
+    url = _safe_text(result.get("url", "")).lower()
+    if _is_non_profile_page(url):
+        return False
+    if "purdue.edu" not in url or _is_non_main_purdue_context(url):
+        return False
+    if not _has_person_specific_profile_anchor(result):
+        return False
+    return relevance >= 10 and signals.get("person_match_confidence") in {"url", "institution_domain"}
+
+
+def _is_authoritative_institution_result(result: Dict[str, Any]) -> bool:
+    signals = result.get("signals") or {}
+    if not _is_profile_like_result(result):
+        if not signals.get("has_historical_profile_anchor"):
+            return False
+    if _looks_like_non_affiliation_result(result) and not _has_person_specific_profile_anchor(result):
+        if not signals.get("has_historical_profile_anchor"):
+            return False
+    if not _has_person_specific_profile_anchor(result) and not signals.get("has_historical_profile_anchor"):
+        return False
+    text = _aggregate_result_text(result).lower()
+    return (
+        _has_person_specific_profile_anchor(result) or signals.get("has_historical_profile_anchor")
+    ) and (
+        _result_has_direct_connection_family(result) or any(
+        term in text for term in _AUTHORITATIVE_AFFILIATION_TERMS
+        )
+    )
+
+
+def _compute_pre_llm_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "result_count": len(results),
+        "max_relevance_score": 0,
+        "purdue_mentions": 0,
+        "purdue_domain_hits": 0,
+        "edu_hits": 0,
+        "institution_signal_hits": 0,
+        "explicit_connection_hits": 0,
+        "person_institution_hits": 0,
+        "academic_role_hits": 0,
+        "degree_hits": 0,
+        "authoritative_institution_hits": 0,
+        "joint_campus_hits": 0,
+        "positive_keyword_hits": 0,
+        "negative_keyword_hits": 0,
+        "negative_result_hits": 0,
+        "total_signal_score": 0,
+        "total_authority_score": 0,
+        "authority_markers": [],
+        "corroborating_result_hits": 0,
+        "negative_shape_hits": 0,
+        "weak_profile_anchor_hits": 0,
+        "historical_role_anchor_hits": 0,
+        "historical_education_anchor_hits": 0,
+        "historical_profile_anchor_hits": 0,
+        "has_direct_connection_family": False,
+        "has_authoritative_profile_family": False,
+        "has_corroborating_support_family": False,
+    }
+
+    authority_markers: List[str] = []
+
+    for result in results:
+        text = _aggregate_result_text(result)
+        lowered, spaced, compact = _normalize_signal_text(text)
+        url = _safe_text(result.get("url", "")).lower()
+        signals = result.get("signals") or {}
+
+        if "purdue" in lowered or "purdue" in spaced:
+            metrics["purdue_mentions"] += 1
+        if "purdue.edu" in url:
+            metrics["purdue_domain_hits"] += 1
+        if urlparse(url).netloc.lower().endswith(".edu"):
+            metrics["edu_hits"] += 1
+        if signals.get("has_institution"):
+            metrics["institution_signal_hits"] += 1
+        direct_connection_family = _result_has_direct_connection_family(result)
+        authoritative_profile_family = _is_authoritative_institution_result(result)
+        supports_corroboration = _result_supports_corroboration(result)
+        historical_role_anchor = bool(signals.get("has_historical_role_anchor"))
+        historical_education_anchor = bool(signals.get("has_historical_education_anchor"))
+        historical_profile_anchor = bool(signals.get("has_historical_profile_anchor"))
+
+        if direct_connection_family:
+            metrics["explicit_connection_hits"] += 1
+        if historical_role_anchor:
+            metrics["historical_role_anchor_hits"] += 1
+        if historical_education_anchor:
+            metrics["historical_education_anchor_hits"] += 1
+        if historical_profile_anchor:
+            metrics["historical_profile_anchor_hits"] += 1
+        if signals.get("has_person_name") and signals.get("has_institution"):
+            metrics["person_institution_hits"] += 1
+        if direct_connection_family and signals.get("has_academic_role"):
+            metrics["academic_role_hits"] += 1
+        if direct_connection_family and _result_has_degree_signal(lowered):
+            metrics["degree_hits"] += 1
+        if signals.get("has_event_prize_pattern"):
+            metrics["negative_result_hits"] += 1
+        if authoritative_profile_family:
+            metrics["authoritative_institution_hits"] += 1
+        if supports_corroboration:
+            metrics["corroborating_result_hits"] += 1
+        if _looks_like_non_affiliation_result(result):
+            metrics["negative_shape_hits"] += 1
+        if _has_person_specific_profile_anchor(result) and not direct_connection_family:
+            metrics["weak_profile_anchor_hits"] += 1
+        if any(pattern in lowered or pattern in url for pattern in JOINT_CAMPUS_PATTERNS):
+            metrics["joint_campus_hits"] += 1
+
+        metrics["max_relevance_score"] = max(
+            metrics["max_relevance_score"],
+            int(signals.get("relevance_score", 0) or 0),
+        )
+
+        for keyword in STRONG_POSITIVE_SIGNAL_KEYWORDS:
+            if keyword and _keyword_matches_text(keyword, lowered, spaced, compact):
+                metrics["positive_keyword_hits"] += 1
+                metrics["total_signal_score"] += 10
+
+        for keyword in KNOWN_FALSE_POSITIVE_SIGNAL_KEYWORDS:
+            if keyword and _keyword_matches_text(keyword, lowered, spaced, compact):
+                metrics["negative_keyword_hits"] += 1
+                metrics["total_signal_score"] -= 10
+
+        authority_score, factors = _score_source_authority(url)
+        metrics["total_authority_score"] += authority_score
+        if factors:
+            authority_markers.extend(factors)
+
+    metrics["authority_markers"] = sorted(set(authority_markers))
+    metrics["multi_result_support"] = (
+        metrics["corroborating_result_hits"] >= 2
+        or (
+            metrics["corroborating_result_hits"] >= 1
+            and metrics["authoritative_institution_hits"] >= 1
+            and metrics["explicit_connection_hits"] >= 1
+        )
+    )
+    metrics["has_direct_connection_family"] = metrics["explicit_connection_hits"] > 0
+    metrics["has_authoritative_profile_family"] = (
+        metrics["authoritative_institution_hits"] > 0
+        or metrics["historical_profile_anchor_hits"] > 0
+    )
+    metrics["has_corroborating_support_family"] = metrics["multi_result_support"]
+    metrics["weak_institution_evidence"] = (
+        metrics["explicit_connection_hits"] == 0
+        and metrics["authoritative_institution_hits"] == 0
+        and metrics["purdue_domain_hits"] == 0
+        and metrics["edu_hits"] == 0
+        and metrics["institution_signal_hits"] == 0
+    )
+    metrics["dominant_negative_signals"] = (
+        metrics["negative_keyword_hits"] >= max(1, metrics["positive_keyword_hits"] + 1)
+        or (
+            metrics["negative_result_hits"] >= 2
+            and metrics["explicit_connection_hits"] == 0
+            and metrics["authoritative_institution_hits"] == 0
+        )
+    )
+    return metrics
+
+
+def _score_pre_llm_metrics(metrics: Dict[str, Any]) -> int:
+    score = 0
+    max_relevance = metrics["max_relevance_score"]
+    score += min(max_relevance, 12)
+    score += min(metrics["purdue_mentions"], 4)
+    score += min(metrics["institution_signal_hits"] * 2, 6)
+    score += min(metrics["person_institution_hits"] * 3, 6)
+    score += min(metrics["authoritative_institution_hits"] * 7, 14)
+    score += min(metrics["explicit_connection_hits"] * 8, 16)
+    score += min(metrics["purdue_domain_hits"] * 4, 8)
+    score += min(metrics["edu_hits"] * 2, 4)
+    score += min(metrics["degree_hits"], 3)
+    score += min(metrics["academic_role_hits"], 3)
+    score += min(metrics["positive_keyword_hits"] // 2, 4)
+
+    if metrics["total_authority_score"] >= 10:
+        score += 3
+    elif metrics["total_authority_score"] <= -5:
+        score -= 4
+
+    if metrics["total_signal_score"] >= 20:
+        score += 3
+    elif metrics["total_signal_score"] <= -20:
+        score -= 4
+
+    if metrics["dominant_negative_signals"]:
+        score -= 8
+    if metrics["joint_campus_hits"] > 0 and metrics["purdue_domain_hits"] == 0:
+        score -= 8
+    if metrics["weak_institution_evidence"]:
+        score -= 6
+    if metrics["negative_shape_hits"] > 0 and metrics["explicit_connection_hits"] == 0:
+        score -= min(metrics["negative_shape_hits"] * 4, 12)
+    if metrics["result_count"] <= 1 and metrics["explicit_connection_hits"] == 0 and metrics["authoritative_institution_hits"] == 0:
+        score -= 3
+    if metrics["result_count"] == 0:
+        score -= 10
+
+    return score
+
+
+def _build_pre_llm_summary(bucket: str, reason_codes: List[str]) -> str:
+    if not reason_codes:
+        if bucket == SURVEY_PLAUSIBLE:
+            return "Search results show at least some plausible institutional evidence."
+        if bucket == SURVEY_BORDERLINE:
+            return "Search results are inconclusive and need a lightweight rescue check."
+        return "Search results do not show a plausible institutional connection."
+
+    pieces = [SURVEY_REASON_SUMMARIES.get(code, code.replace("_", " ")) for code in reason_codes[:3]]
+    if bucket == SURVEY_PLAUSIBLE:
+        return "; ".join(pieces)
+    if bucket == SURVEY_BORDERLINE:
+        return f"Borderline evidence: {'; '.join(pieces)}"
+    return f"No plausible connection: {'; '.join(pieces)}"
+
+
+def evaluate_pre_llm_survey(
+    results: List[Dict[str, Any]],
+    dataset_profile: str = None,
+    name: Optional[str] = None,
+    *,
+    used_rescue_query: bool = False,
+) -> PreLlmSurveyDecision:
+    hard_no_threshold, plausible_threshold = _profile_survey_thresholds(dataset_profile)
+    low_connection_profile = _is_low_connection_profile(dataset_profile)
+
+    if not PRE_LLM_SURVEY_ENABLED:
+        metrics = {
+            "result_count": len(results),
+            "stage": SURVEY_STAGE_PASS_WEAK,
+        }
+        return PreLlmSurveyDecision(
+            bucket=SURVEY_PLAUSIBLE,
+            score=plausible_threshold,
+            reason_codes=("survey_disabled",),
+            summary=_build_pre_llm_summary(SURVEY_PLAUSIBLE, ["survey_disabled"]),
+            used_rescue_query=used_rescue_query,
+            metrics=metrics,
+        )
+
+    vip_mode = PRE_LLM_SURVEY_VIP_BYPASS and (_is_vip_name(name) or _has_vip_signals(results))
+    metrics = _compute_pre_llm_metrics(results)
+    score = _score_pre_llm_metrics(metrics)
+    reason_codes: List[str] = []
+
+    if vip_mode:
+        reason_codes.append("vip_bypass")
+        summary = _build_pre_llm_summary(SURVEY_PLAUSIBLE, reason_codes)
+        metrics = dict(metrics)
+        metrics["stage"] = SURVEY_STAGE_PASS_STRONG
+        return PreLlmSurveyDecision(
+            bucket=SURVEY_PLAUSIBLE,
+            score=max(score, plausible_threshold),
+            reason_codes=tuple(reason_codes),
+            summary=summary,
+            used_rescue_query=used_rescue_query,
+            metrics=metrics,
+        )
+
+    if metrics["result_count"] == 0:
+        reason_codes.append("no_results")
+    if metrics["explicit_connection_hits"] > 0:
+        reason_codes.append("explicit_connection")
+    if metrics["authoritative_institution_hits"] > 0:
+        reason_codes.append("authoritative_institution_page")
+    if metrics["purdue_domain_hits"] > 0:
+        reason_codes.append("institution_domain_hit")
+    if metrics["edu_hits"] > 0:
+        reason_codes.append("edu_signal")
+    if metrics["multi_result_support"]:
+        reason_codes.append("multi_result_support")
+    if metrics["person_institution_hits"] > 0:
+        reason_codes.append("person_institution_match")
+    if metrics["max_relevance_score"] >= 12:
+        reason_codes.append("strong_relevance")
+    if metrics["weak_institution_evidence"]:
+        reason_codes.append("weak_institution_evidence")
+    if metrics["joint_campus_hits"] > 0 and metrics["purdue_domain_hits"] == 0:
+        reason_codes.append("joint_campus_only")
+    if metrics["dominant_negative_signals"]:
+        reason_codes.append("dominant_negative_signals")
+    if metrics["negative_shape_hits"] > 0:
+        reason_codes.append("non_affiliation_shape")
+    if metrics["weak_profile_anchor_hits"] > 0:
+        reason_codes.append("weak_profile_anchor")
+    if _has_historical_anchor_metrics(metrics):
+        reason_codes.append("historical_anchor")
+    if metrics["total_authority_score"] <= 0 and metrics["authoritative_institution_hits"] == 0:
+        reason_codes.append("low_authority_sources")
+
+    has_direct_connection_family = bool(metrics["has_direct_connection_family"])
+    has_authoritative_profile_family = bool(metrics["has_authoritative_profile_family"])
+    has_corroborating_support_family = bool(metrics["has_corroborating_support_family"])
+    signal_family_count = sum(
+        1
+        for flag in (
+            has_direct_connection_family,
+            has_authoritative_profile_family,
+            has_corroborating_support_family,
+        )
+        if flag
+    )
+
+    strong_domain_evidence = (
+        has_authoritative_profile_family
+        or has_direct_connection_family
+        or metrics["purdue_domain_hits"] > 0
+    )
+
+    obvious_direct_profile_case = (
+        has_direct_connection_family
+        and has_authoritative_profile_family
+        and metrics["purdue_domain_hits"] > 0
+        and metrics["person_institution_hits"] > 0
+    )
+
+    weak_true_profile_case = (
+        metrics["weak_profile_anchor_hits"] > 0
+        and metrics["purdue_domain_hits"] > 0
+        and metrics["person_institution_hits"] > 0
+        and metrics["negative_shape_hits"] == 0
+    )
+    anchored_historical_case = (
+        _has_historical_anchor_metrics(metrics)
+        and metrics["person_institution_hits"] > 0
+    )
+
+    legacy_positive_shape = (
+        used_rescue_query
+        and metrics["explicit_connection_hits"] > 0
+        and metrics["authoritative_institution_hits"] == 0
+        and metrics["person_institution_hits"] >= 5
+        and metrics["purdue_domain_hits"] >= 2
+        and metrics["edu_hits"] >= 4
+        and metrics["max_relevance_score"] >= 25
+        and metrics["total_authority_score"] >= 20
+        and metrics["negative_shape_hits"] <= max(2, metrics["explicit_connection_hits"] + 1)
+    )
+    if legacy_positive_shape:
+        reason_codes.append("legacy_positive_shape")
+
+    score_promotable = (
+        score >= plausible_threshold
+        and (
+            signal_family_count >= 2
+            or weak_true_profile_case
+            or anchored_historical_case
+            or legacy_positive_shape
+        )
+    )
+
+    direct_plausible = (
+        obvious_direct_profile_case
+        or signal_family_count >= 2
+        or weak_true_profile_case
+        or anchored_historical_case
+        or legacy_positive_shape
+    )
+    allow_score_plausible = True
+    direct_hard_no = (
+        metrics["result_count"] == 0
+        or (
+            metrics["explicit_connection_hits"] == 0
+            and metrics["authoritative_institution_hits"] == 0
+            and metrics["purdue_domain_hits"] == 0
+            and metrics["edu_hits"] == 0
+            and metrics["max_relevance_score"] < 6
+            and metrics["purdue_mentions"] <= 1
+            and metrics["person_institution_hits"] == 0
+            and metrics["total_authority_score"] <= 0
+            and not _has_historical_anchor_metrics(metrics)
+        )
+        or (
+            metrics["dominant_negative_signals"]
+            and metrics["authoritative_institution_hits"] == 0
+            and metrics["explicit_connection_hits"] == 0
+            and metrics["total_authority_score"] <= 0
+            and not _has_historical_anchor_metrics(metrics)
+        )
+        or (
+            metrics["joint_campus_hits"] > 0
+            and metrics["purdue_domain_hits"] == 0
+            and metrics["authoritative_institution_hits"] == 0
+            and metrics["explicit_connection_hits"] == 0
+            and not _has_historical_anchor_metrics(metrics)
+        )
+        or (
+            used_rescue_query
+            and metrics["explicit_connection_hits"] == 0
+            and metrics["authoritative_institution_hits"] == 0
+            and metrics["purdue_domain_hits"] > 0
+            and metrics["person_institution_hits"] > 0
+            and not _has_historical_anchor_metrics(metrics)
+        )
+        or (
+            used_rescue_query
+            and metrics["negative_shape_hits"] > 0
+            and metrics["explicit_connection_hits"] == 0
+            and metrics["authoritative_institution_hits"] == 0
+            and metrics["weak_profile_anchor_hits"] == 0
+            and not _has_historical_anchor_metrics(metrics)
+        )
+        or (
+            used_rescue_query
+            and metrics["negative_shape_hits"] > 0
+            and metrics["weak_profile_anchor_hits"] == 0
+            and metrics["purdue_domain_hits"] > 0
+            and metrics["person_institution_hits"] > 0
+            and signal_family_count < 2
+            and not _has_historical_anchor_metrics(metrics)
+        )
+    )
+
+    if low_connection_profile:
+        very_weak_low_connection = (
+            metrics["explicit_connection_hits"] == 0
+            and metrics["authoritative_institution_hits"] == 0
+            and metrics["person_institution_hits"] == 0
+            and metrics["purdue_domain_hits"] == 0
+            and metrics["max_relevance_score"] < PRE_LLM_SURVEY_LOW_CONNECTION_MIN_RELEVANCE_FOR_ESCALATION
+        )
+        if very_weak_low_connection:
+            direct_hard_no = True
+
+        if PRE_LLM_SURVEY_LOW_CONNECTION_REQUIRE_STRONG_DOMAIN and not strong_domain_evidence:
+            if score >= plausible_threshold:
+                reason_codes.append("low_connection_strict_gate")
+            direct_plausible = False
+            allow_score_plausible = False
+
+    force_negative_hard_no = (
+        direct_hard_no
+        and used_rescue_query
+        and metrics["negative_shape_hits"] > 0
+        and metrics["explicit_connection_hits"] == 0
+        and metrics["authoritative_institution_hits"] == 0
+        and metrics["weak_profile_anchor_hits"] == 0
+    )
+
+    if direct_plausible or (allow_score_plausible and score_promotable):
+        bucket = SURVEY_PLAUSIBLE
+    elif force_negative_hard_no or (direct_hard_no and score <= hard_no_threshold):
+        bucket = SURVEY_HARD_NO
+    elif PRE_LLM_SURVEY_TRI_STATE:
+        bucket = SURVEY_BORDERLINE
+    else:
+        bucket = SURVEY_PLAUSIBLE
+
+    metrics = dict(metrics)
+    metrics["stage"] = _classify_pre_llm_stage(
+        bucket,
+        metrics,
+        used_rescue_query=used_rescue_query,
+    )
+    summary = _build_pre_llm_summary(bucket, reason_codes)
+    return PreLlmSurveyDecision(
+        bucket=bucket,
+        score=score,
+        reason_codes=tuple(reason_codes),
+        summary=summary,
+        used_rescue_query=used_rescue_query,
+        metrics=metrics,
+    )
+
+
+def _serialize_pre_llm_reason_codes(reason_codes: Tuple[str, ...]) -> str:
+    return "|".join(reason_codes)
+
+
+def _apply_pre_llm_audit(
+    result: Dict[str, str],
+    decision: Optional[PreLlmSurveyDecision],
+) -> Dict[str, str]:
+    payload = dict(result)
+    payload["pre_llm_bucket"] = decision.bucket if decision else ""
+    payload["pre_llm_stage"] = str(decision.metrics.get("stage", "")) if decision else ""
+    payload["pre_llm_score"] = str(decision.score) if decision else ""
+    payload["pre_llm_summary"] = decision.summary if decision else ""
+    payload["pre_llm_reason_codes"] = _serialize_pre_llm_reason_codes(decision.reason_codes) if decision else ""
+    payload["pre_llm_used_rescue_query"] = "Y" if decision and decision.used_rescue_query else "N"
+    return payload
+
+
+async def run_pre_llm_survey(
+    name: str,
+    results: List[Dict[str, Any]],
+    dataset_profile: str = None,
+    debug: bool = False,
+) -> tuple[List[Dict[str, Any]], PreLlmSurveyDecision]:
+    decision = evaluate_pre_llm_survey(results, dataset_profile=dataset_profile, name=name)
+    borderline_subtype = classify_validation_borderline(name, decision)[0]
+    if _should_demote_validation_borderline_to_hard_no(name, decision, borderline_subtype, dataset_profile):
+        demoted_metrics = dict(decision.metrics)
+        demoted_metrics["stage"] = SURVEY_STAGE_REJECT_FAST
+        demoted_decision = PreLlmSurveyDecision(
+            bucket=SURVEY_HARD_NO,
+            score=decision.score,
+            reason_codes=decision.reason_codes,
+            summary=decision.summary,
+            used_rescue_query=decision.used_rescue_query,
+            metrics=demoted_metrics,
+        )
+        return results, demoted_decision
+
+    if decision.bucket != SURVEY_BORDERLINE or not PRE_LLM_SURVEY_ENABLE_BORDERLINE_RESCUE:
+        return results, decision
+
+    should_rescue, _, borderline_subtype = should_attempt_validation_rescue(name, decision)
+    if not should_rescue:
+        return results, decision
+
+    rescue_query = PRE_LLM_SURVEY_RESCUE_QUERY_TEMPLATE.format(name=name)
+    if debug:
+        print(f"[SURVEY] Borderline result for {name}; running rescue query: {rescue_query}")
+
+    rescue_results, _ = await validation_search_query(
+        rescue_query,
+        institution=INSTITUTION,
+        person_name=name,
+        limit=PRE_LLM_SURVEY_RESCUE_NUM_RESULTS,
+        debug=debug,
+        prefer_backend="ddg",
+        allow_bing_fallback=False,
+        allow_slow_ddg_fallback=False,
+        ensure_tokens=False,
+    )
+    merged_results = _dedupe_by_url(list(results) + list(rescue_results))
+    rescued_decision = evaluate_pre_llm_survey(
+        merged_results,
+        dataset_profile=dataset_profile,
+        name=name,
+        used_rescue_query=True,
+    )
+
+    reason_codes = list(rescued_decision.reason_codes)
+    if rescued_decision.bucket == SURVEY_PLAUSIBLE:
+        if "rescue_query_promoted" not in reason_codes:
+            reason_codes.append("rescue_query_promoted")
+    else:
+        if _should_demote_validation_borderline_to_hard_no(
+            name,
+            rescued_decision,
+            classify_validation_borderline(name, rescued_decision)[0],
+            dataset_profile,
+        ):
+            if "rescue_query_failed" not in reason_codes:
+                reason_codes.append("rescue_query_failed")
+            rescued_metrics = dict(rescued_decision.metrics)
+            rescued_metrics["stage"] = _classify_pre_llm_stage(
+                SURVEY_HARD_NO,
+                rescued_metrics,
+                used_rescue_query=True,
+            )
+            rescued_decision = PreLlmSurveyDecision(
+                bucket=SURVEY_HARD_NO,
+                score=rescued_decision.score,
+                reason_codes=tuple(reason_codes),
+                summary=_build_pre_llm_summary(SURVEY_HARD_NO, reason_codes),
+                used_rescue_query=True,
+                metrics=rescued_metrics,
+            )
+            return merged_results, rescued_decision
+        if "rescue_query_failed" not in reason_codes:
+            reason_codes.append("rescue_query_failed")
+
+    rescued_metrics = dict(rescued_decision.metrics)
+    rescued_metrics["stage"] = _classify_pre_llm_stage(
+        rescued_decision.bucket,
+        rescued_metrics,
+        used_rescue_query=True,
+    )
+    rescued_decision = PreLlmSurveyDecision(
+        bucket=rescued_decision.bucket,
+        score=rescued_decision.score,
+        reason_codes=tuple(reason_codes),
+        summary=_build_pre_llm_summary(rescued_decision.bucket, reason_codes),
+        used_rescue_query=True,
+        metrics=rescued_metrics,
+    )
+    return merged_results, rescued_decision
+
+
 def should_skip_llm(
     results: List[Dict[str, Any]],
     dataset_profile: str = None,
@@ -682,201 +2040,9 @@ def should_skip_llm(
     Returns:
         (should_skip: bool, reason: Optional[str])
     """
-    from .config import get_filtering_mode, get_skip_threshold
-    
-    filtering_mode = get_filtering_mode(dataset_profile)
-    skip_threshold = get_skip_threshold(dataset_profile)
-
-    vip_mode = _is_vip_name(name) or _has_vip_signals(results)
-    if vip_mode:
-        return False, None
-    
-    if not results:
-        return True, "No search results found"
-    
-    total_signal_score = 0
-    total_authority_score = 0
-    positive_matches: set[str] = set()
-    negative_matches: set[str] = set()
-    authority_markers: List[str] = []
-    purdue_mentions = 0
-    purdue_domain_hits = 0
-    institution_signal_hits = 0
-    max_relevance_score = 0
-    has_explicit_connection = False
-    
-    for result in results:
-        text = _aggregate_result_text(result)
-        lowered, spaced, compact = _normalize_signal_text(text)
-        if "purdue" in lowered or "purdue" in spaced:
-            purdue_mentions += 1
-        
-        for keyword in STRONG_POSITIVE_SIGNAL_KEYWORDS:
-            if keyword and _keyword_matches_text(keyword, lowered, spaced, compact):
-                total_signal_score += 10
-                positive_matches.add(keyword)
-        
-        for keyword in KNOWN_FALSE_POSITIVE_SIGNAL_KEYWORDS:
-            if keyword and _keyword_matches_text(keyword, lowered, spaced, compact):
-                total_signal_score -= 10
-                negative_matches.add(keyword)
-        
-        url = result.get("url") or ""
-        url_lower = url.lower()
-        if "purdue.edu" in url_lower:
-            purdue_domain_hits += 1
-
-        signals = result.get("signals") or {}
-        if signals.get("has_institution"):
-            institution_signal_hits += 1
-        if signals.get("has_explicit_connection"):
-            has_explicit_connection = True
-        
-        # Track max relevance score
-        relevance_score = signals.get("relevance_score", 0)
-        max_relevance_score = max(max_relevance_score, relevance_score)
-
-        authority_score, factors = _score_source_authority(url)
-        total_authority_score += authority_score
-        if factors:
-            authority_markers.extend(factors)
-    
-    # ADAPTIVE FILTERING based on dataset profile
-    if filtering_mode == "aggressive":
-        # Low-connection datasets (e.g., Nobel laureates): Skip MUCH more aggressively
-        # to reduce wasted LLM API calls from ~200 to ~50 for datasets with <2% true connections
-        
-        # Check for critical keywords that should always trigger LLM review
-        # NOTE: Removed "nobel" to allow unrelated laureates to skip
-        has_critical_keywords = False 
-        
-        # SAFETY: Only bypass if we have overwhelming keyword matches
-        if purdue_mentions >= 4 and institution_signal_hits >= 2:
-             # Let LLM verify - very dense mentions of Purdue
-             return False, None
-        
-        # Tier 1: Skip if below threshold (score < 8) with NO strong signals
-        if max_relevance_score < skip_threshold:
-            has_strong_signals = (
-                (purdue_domain_hits > 0 and has_explicit_connection) or 
-                total_signal_score > 30
-            )
-            if not has_strong_signals:
-                return True, f"Aggressive filter (Tier 1): max_relevance_score={max_relevance_score} < {skip_threshold}, no strong rescue signals"
-        
-        # Tier 2: Skip if score is marginal (8-15) without excellent evidence
-        # Score 8 ~ 15 = name + institution mention + weak signal, often garbage
-        # Increased threshold to 15 to catch more "loose" connections
-        if 8 <= max_relevance_score < 15:
-            has_excellent_evidence = (
-                purdue_domain_hits >= 2 or  # Multiple .edu results = authoritative
-                (purdue_domain_hits >= 1 and has_explicit_connection) or  # .edu + explicit = strong
-                total_signal_score >= 40 or # Very high signal score = multiple strong keywords
-                (has_explicit_connection and max_relevance_score >= 12) # Explicit + decent score
-            )
-            if not has_excellent_evidence:
-                return True, f"Aggressive filter (Tier 2): max_relevance_score={max_relevance_score} is marginal, lacks excellent evidence (low-connection dataset)"
-        
-        # Tier 3: Skip if only weak positive signals (< 10) without institutional backing
-        # No .edu domain AND weak relevance = very likely false positive (citations, lists, etc.)
-        # CRITICAL: Keep threshold at 10 (not 15) to avoid skipping genuine connections with modest initial scores
-        if max_relevance_score < 10 and purdue_domain_hits == 0:
-            if not has_explicit_connection and total_signal_score < 10:
-                # Only skip if BOTH no explicit connection AND low signal score
-                return True, f"Aggressive filter (Tier 3): max_relevance_score={max_relevance_score}, no .edu domain, no explicit connection, low signals (low-connection dataset)"
-        
-        # Tier 4: CONFIDENT NEGATIVE - Ultra-safe patterns to catch obvious non-connections
-        # Goal: Improve skip rate from 80% to 95%+ while maintaining 100% recall
-        
-        # Pattern A: Dominant negative keywords with NO positive signals
-        # Example: Conference speaker, prize winner with no employment keywords
-        if (total_signal_score <= -30 and 
-            len(positive_matches) == 0 and 
-            purdue_domain_hits == 0):
-            return True, f"Confident negative (Tier 4-A): dominant negative signals (score={total_signal_score}), no positive keywords, no .edu domain"
-        
-        # Pattern B: Only low-quality sources with weak relevance
-        # Example: prabook.com, alchetron.com mentions with no authoritative sources
-        if (max_relevance_score < 10 and
-            total_authority_score <= -5 and
-            purdue_domain_hits == 0 and
-            not has_explicit_connection):
-            return True, f"Confident negative (Tier 4-B): only low-quality sources (authority={total_authority_score}), score={max_relevance_score}, no .edu, no explicit connection"
-        
-        # Pattern C: Virtually no institution mention at all
-        # Example: Person name appears but institution barely mentioned (citation list)
-        # FIX: Lowered threshold from 3 to 1 to avoid skipping soft matches (score=1) that might be valid
-        if (purdue_mentions == 0 and 
-            institution_signal_hits == 0 and 
-            max_relevance_score < 1):
-            return True, f"Confident negative (Tier 4-C): no institution mentions, score={max_relevance_score} (virtually zero relevance)"
-    
-    # Conservative policy: only skip completely off-topic results
-    # For high_connection profile, use SMART filtering - skip when NO evidence exists
-    if filtering_mode == "conservative":
-        # SMART SKIP FOR HIGH_CONNECTION: Skip when there's genuinely NO Purdue evidence
-        # This balances accuracy (don't miss real connections) with efficiency (don't waste LLM calls)
-        
-        # Skip Pattern 1: Zero relevance - no institution mention at all
-        if max_relevance_score == 0 and purdue_mentions == 0 and institution_signal_hits == 0:
-            return True, f"Smart skip: zero relevance (no institution signals found)"
-        
-        # Skip Pattern 2: Very low relevance with no Purdue mentions
-        # Score < 3 means barely any match, and if Purdue isn't even mentioned, it's not relevant
-        if max_relevance_score < 3 and purdue_mentions == 0 and purdue_domain_hits == 0:
-            return True, f"Smart skip: very low relevance (score={max_relevance_score}, no Purdue mentions)"
-        
-        # Skip Pattern 3: Low relevance with ONLY negative signals
-        # If we have some results but they're all negative context (conference, speaker, etc.)
-        if (max_relevance_score < 5 and 
-            total_signal_score < 0 and 
-            not positive_matches and
-            purdue_domain_hits == 0):
-            return True, f"Smart skip: low relevance with negative context (score={max_relevance_score}, signal={total_signal_score})"
-        
-        # Skip Pattern 4: No authoritative sources and weak signals
-        # If there's no .edu domain and relevance is marginal, likely a false lead
-        if (max_relevance_score < 6 and
-            purdue_domain_hits == 0 and
-            purdue_mentions <= 1 and
-            total_signal_score <= 0 and
-            not has_explicit_connection):
-            return True, f"Smart skip: weak evidence without authority (score={max_relevance_score}, no .edu, mentions={purdue_mentions})"
-        
-        # Otherwise, send to LLM for analysis
-    else:
-        # LOW CONNECTION MODE: Original stricter filtering
-        if (
-            total_signal_score < 0
-            and not positive_matches
-            and purdue_mentions == 0
-            and purdue_domain_hits == 0
-            and institution_signal_hits == 0
-        ):
-            negatives_summary = ", ".join(sorted(negative_matches)) if negative_matches else "negative context"
-            return True, (
-                f"Heuristic triage: negative evidence dominates "
-                f"(signal score {total_signal_score}, negatives: {negatives_summary})"
-            )
-        
-        if (
-            total_signal_score == 0
-            and total_authority_score < 5
-            and not positive_matches
-            and purdue_mentions == 0
-            and purdue_domain_hits == 0
-            and institution_signal_hits == 0
-        ):
-            unique_markers = sorted(set(authority_markers))
-            marker_summary = f"; authority markers: {', '.join(unique_markers[:3])}" if unique_markers else ""
-            return True, (
-                f"Heuristic triage: no meaningful evidence "
-                f"(signal score {total_signal_score}, authority score {total_authority_score}){marker_summary}"
-            )
-
-    if total_signal_score > 20 and total_authority_score > 10:
-        return False, None
-    
+    decision = evaluate_pre_llm_survey(results, dataset_profile=dataset_profile, name=name)
+    if decision.bucket == SURVEY_HARD_NO:
+        return True, decision.summary
     return False, None
 
 
@@ -962,6 +2128,7 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
 
     # ===== PHASE 1: Search (all in parallel) =====
     print(f"[BATCH] Phase 1: Running searches in parallel for all {len(names)} names (max {MAX_CONCURRENT_SEARCHES} concurrent)")
+    print(f"[BATCH] Phase 2: Streaming LLM as each search completes (max {MAX_CONCURRENT_LLM_CALLS} concurrent)")
     search_phase_start = time.time()
     
     # Create semaphore to limit concurrent searches
@@ -970,116 +2137,151 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
     async def search_with_semaphore(name: str):
         # Add random jitter to prevent thundering herd
         # Reduced jitter (0.5-2s) as DDG is prioritized
-        await asyncio.sleep(random.uniform(0.5, 2.0))
+        await asyncio.sleep(random.uniform(SEARCH_JITTER_MIN, SEARCH_JITTER_MAX))
         async with search_semaphore:
-            # Use process_name_search which has its own internal timeout (SEARCH_TIMEOUT)
-            # We do NOT wrap this in an outer timeout because queuing time might be significant
-            return await process_name_search(name, use_enhanced_search, debug=debug, dataset_profile=dataset_profile)
+            allow_recovery_fallback = _should_allow_slow_recovery_fallback(name)
+            allow_enhanced = use_enhanced_search and (_is_vip_name(name) or not VIP_ONLY_ENHANCED)
+            return await asyncio.wait_for(
+                _run_staged_pre_llm_search(
+                    name,
+                    dataset_profile=dataset_profile,
+                    debug=debug,
+                    allow_enhanced=allow_enhanced,
+                    allow_bing_recovery_fallback=allow_recovery_fallback,
+                    allow_slow_ddg_recovery_fallback=allow_recovery_fallback,
+                    cache_enabled=False,
+                ),
+                timeout=SEARCH_TIMEOUT,
+            )
 
-    search_coroutines = [
-        search_with_semaphore(name)
-        for name in names
-    ]
-    search_outcomes = await asyncio.gather(*search_coroutines, return_exceptions=True)
-    
-    search_phase_elapsed = time.time() - search_phase_start
-    print(f"[BATCH] Phase 1 completed in {search_phase_elapsed:.1f}s")
-    
-    # Process search results
-    search_results: Dict[str, List[Dict[str, Any]]] = {}
+    async def search_with_name(name: str):
+        try:
+            outcome = await search_with_semaphore(name)
+            return name, outcome, None
+        except Exception as exc:
+            return name, None, exc
+
+    search_tasks = [asyncio.create_task(search_with_name(name)) for name in names]
+
+    # Process search/LLM as results arrive to avoid one slow search blocking the whole batch.
+    search_metadata_map: Dict[str, Dict[str, Any]] = {}
     failed_searches: Dict[str, Exception] = {}
-    
-    for name, outcome in zip(names, search_outcomes):
-        if isinstance(outcome, BaseException):
-            error_msg = str(outcome)
+    skipped_results: Dict[str, Dict[str, str]] = {}
+    llm_task_map: Dict[str, asyncio.Task] = {}
+    llm_decision_map: Dict[str, PreLlmSurveyDecision] = {}
+    llm_outcome_map: Dict[str, Any] = {}
+
+    survey_counts = {
+        SURVEY_HARD_NO: 0,
+        SURVEY_BORDERLINE: 0,
+        SURVEY_PLAUSIBLE: 0,
+        "rescue_used": 0,
+        "rescue_promoted": 0,
+    }
+
+    # Create semaphore to limit concurrent LLM calls
+    llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+
+    async def llm_with_semaphore(
+        name: str,
+        results: List[Dict[str, Any]],
+        survey_decision: PreLlmSurveyDecision,
+    ) -> Dict[str, str]:
+        async with llm_semaphore:
+            return await asyncio.wait_for(
+                process_name_llm(
+                    name,
+                    results,
+                    debug=debug,
+                    dataset_profile=dataset_profile,
+                    pre_llm_decision=survey_decision,
+                ),
+                timeout=NAME_TIMEOUT
+            )
+
+    for completed in asyncio.as_completed(search_tasks):
+        name, outcome, error = await completed
+        if error is None:
+            results, survey_decision, search_metadata = outcome
+            search_metadata_map[name] = search_metadata
+            timing_basic = float(search_metadata.get("timing_basic_s", 0.0) or 0.0)
+            timing_rescue = float(search_metadata.get("timing_rescue_s", 0.0) or 0.0)
+            timing_enhanced = float(search_metadata.get("timing_enhanced_s", 0.0) or 0.0)
+            timing_total = float(search_metadata.get("timing_total_s", 0.0) or 0.0)
+            print(
+                f"[BATCH] Search succeeded for {name}: {len(results)} results "
+                f"(mode={search_metadata.get('search_mode_used')}, queries={search_metadata.get('network_queries_used')}, "
+                f"bucket={survey_decision.bucket}, t_basic={timing_basic:.1f}s, "
+                f"t_rescue={timing_rescue:.1f}s, t_enh={timing_enhanced:.1f}s, t_total={timing_total:.1f}s)"
+            )
+
+            survey_counts[survey_decision.bucket] += 1
+            if survey_decision.used_rescue_query:
+                survey_counts["rescue_used"] += 1
+                if "rescue_query_promoted" in survey_decision.reason_codes:
+                    survey_counts["rescue_promoted"] += 1
+
+            if survey_decision.bucket == SURVEY_HARD_NO:
+                skipped_results[name] = _build_immediate_not_connected(
+                    name,
+                    INSTITUTION,
+                    survey_decision.summary,
+                    pre_llm_decision=survey_decision,
+                )
+                print(f"[BATCH] [HARD-NO] Skipping LLM for {name}: {survey_decision.summary}")
+            else:
+                llm_decision_map[name] = survey_decision
+                llm_task_map[name] = asyncio.create_task(llm_with_semaphore(name, results, survey_decision))
+        else:
+            error_msg = str(error)
             if "timeout" in error_msg.lower():
                 print(f"[BATCH] Search timed out for {name}: {error_msg}")
             else:
                 print(f"[BATCH] Search failed for {name}: {error_msg}")
-            failed_searches[name] = outcome
-            search_results[name] = []  # Empty results for failed searches
-        else:
-            result_name, results = outcome
-            search_results[result_name] = results
-            print(f"[BATCH] Search succeeded for {name}: {len(results)} results")
+            failed_searches[name] = error
+
+    search_phase_elapsed = time.time() - search_phase_start
+    print(f"[BATCH] Phase 1 completed in {search_phase_elapsed:.1f}s")
+
+    _print_search_metadata_summary("[BATCH]", list(search_metadata_map.values()))
     
-    # ===== PHASE 2: LLM Analysis (with early termination for obvious cases) =====
-    print(f"[BATCH] Phase 2: Evaluating search results and running LLM analysis in parallel for all {len(names)} names (max {MAX_CONCURRENT_LLM_CALLS} concurrent)")
+    # ===== PHASE 2: LLM Analysis (overlapped with search) =====
     llm_phase_start = time.time()
-    
-    # First pass: identify which names need LLM vs which can skip it
-    names_needing_llm: List[str] = []
-    skipped_results: Dict[str, Dict[str, str]] = {}
-    skipped_count = 0
-    
-    for name in names:
-        results = search_results.get(name, [])
-        should_skip, skip_reason = should_skip_llm(results, dataset_profile=dataset_profile, name=name)
-        
-        if should_skip:
-            skipped_result = _build_immediate_not_connected(name, INSTITUTION, skip_reason or "No results found")
-            skipped_results[name] = skipped_result
-            skipped_count += 1
-            # Enhanced logging: Show which tier/pattern triggered the skip
-            tier_marker = ""
-            if "Tier 1" in skip_reason:
-                tier_marker = "[T1]"
-            elif "Tier 2" in skip_reason:
-                tier_marker = "[T2]"
-            elif "Tier 3" in skip_reason:
-                tier_marker = "[T3]"
-            elif "Tier 4" in skip_reason or "Confident negative" in skip_reason:
-                tier_marker = "[T4]"
-            elif "negative evidence dominates" in skip_reason:
-                tier_marker = "[NEG]"
-            else:
-                tier_marker = "[SKIP]"
-            print(f"[BATCH] {tier_marker} Skipping LLM for {name}: {skip_reason}")
-        else:
-            names_needing_llm.append(name)
-    
+    skipped_count = len(skipped_results)
+    names_needing_llm = list(llm_task_map.keys())
+
+    print(
+        f"[BATCH] Survey counts: hard_no={survey_counts[SURVEY_HARD_NO]}, "
+        f"borderline={survey_counts[SURVEY_BORDERLINE]}, plausible={survey_counts[SURVEY_PLAUSIBLE]}, "
+        f"rescue_used={survey_counts['rescue_used']}, rescue_promoted={survey_counts['rescue_promoted']}"
+    )
     if skipped_count > 0:
         print(f"[BATCH] Skipped LLM for {skipped_count} name(s) with obvious non-connections, {len(names_needing_llm)} names need LLM")
-    
-    # Create semaphore to limit concurrent LLM calls
-    llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
-    
-    async def llm_with_semaphore(name: str, results: List[Dict[str, Any]]) -> Dict[str, str]:
-        async with llm_semaphore:
-            return await asyncio.wait_for(
-                process_name_llm(name, results, debug=debug, dataset_profile=dataset_profile),
-                timeout=NAME_TIMEOUT
-            )
-    
-    llm_coroutines = [
-        llm_with_semaphore(name, search_results.get(name, []))
-        for name in names_needing_llm
-    ]
-    llm_outcomes = await asyncio.gather(*llm_coroutines, return_exceptions=True)
-    
+
+    if llm_task_map:
+        llm_names = list(llm_task_map.keys())
+        llm_tasks = [llm_task_map[name] for name in llm_names]
+        llm_outcomes = await asyncio.gather(*llm_tasks, return_exceptions=True)
+        llm_outcome_map = {name: outcome for name, outcome in zip(llm_names, llm_outcomes)}
+
     llm_phase_elapsed = time.time() - llm_phase_start
     print(f"[BATCH] Phase 2 completed in {llm_phase_elapsed:.1f}s ({len(names_needing_llm)} LLM calls, {skipped_count} skipped)")
     
     # ===== Combine results =====
     ordered_results: List[Dict[str, str]] = []
     completed_count = 0
-    
-    # First add skipped results (they're already complete)
+
     for name in names:
-        if name in skipped_results:
-            ordered_results.append(skipped_results[name])
-            completed_count += 1
-    
-    # Then add LLM results in order
-    llm_outcome_map: Dict[str, Any] = dict(zip(names_needing_llm, llm_outcomes))
-    
-    for name in names:
-        if name in skipped_results:
-            continue  # Already added above
-        
-        llm_outcome = llm_outcome_map.get(name)
         completed_count += 1
         elapsed = time.time() - batch_start
+
+        if name in skipped_results:
+            ordered_results.append(skipped_results[name])
+            print(f"[BATCH] Completed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
+            continue
+
+        llm_outcome = llm_outcome_map.get(name)
+        llm_decision = llm_decision_map.get(name)
         
         # Check if search failed first
         if name in failed_searches:
@@ -1091,27 +2293,27 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
             error_result = _build_error(str(error))
             error_result["name"] = name
             error_result["institution"] = INSTITUTION
-            result = error_result
+            result = _apply_pre_llm_audit(error_result, None)
         elif llm_outcome is None:
             # This shouldn't happen (should_skip_llm or LLM should provide result), but defensive check
             print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) - unexpected None outcome")
             error_result = _build_error("Unexpected None outcome from LLM phase")
             error_result["name"] = name
             error_result["institution"] = INSTITUTION
-            result = error_result
+            result = _apply_pre_llm_audit(error_result, llm_decision)
         elif isinstance(llm_outcome, BaseException):
             if isinstance(llm_outcome, asyncio.TimeoutError):
                 print(f"[BATCH] Timed out {completed_count}/{len(names)} ({name}) - LLM timeout after {elapsed:.1f}s")
                 error_result = _build_error(str(NameProcessingTimeout(name, NAME_TIMEOUT)))
                 error_result["name"] = name
                 error_result["institution"] = INSTITUTION
-                result = error_result
+                result = _apply_pre_llm_audit(error_result, llm_decision)
             else:
                 print(f"[BATCH] Failed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s: {llm_outcome}")
                 error_result = _build_error(str(llm_outcome))
                 error_result["name"] = name
                 error_result["institution"] = INSTITUTION
-                result = error_result
+                result = _apply_pre_llm_audit(error_result, llm_decision)
         else:
             print(f"[BATCH] Completed {completed_count}/{len(names)} ({name}) in {elapsed:.1f}s")
             result = llm_outcome
@@ -1139,7 +2341,11 @@ def save_final_results(results: List[Dict[str, str]]) -> None:
     print(f"[INFO] Results saved to {RESULTS_PATH}")
 
 
-async def _process_llm_batch(llm_batch: List[tuple], debug: bool = False, dataset_profile: str = None) -> List[Dict[str, str]]:
+async def _process_llm_batch(
+    llm_batch: List[tuple[str, List[Dict[str, Any]], PreLlmSurveyDecision]],
+    debug: bool = False,
+    dataset_profile: str = None,
+) -> List[Dict[str, str]]:
     """Process a batch of names through LLM with controlled parallelism.
     
     Args:
@@ -1159,23 +2365,33 @@ async def _process_llm_batch(llm_batch: List[tuple], debug: bool = False, datase
     # Create semaphore to limit concurrent LLM calls
     llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
     
-    async def llm_with_semaphore(name: str, results: List[Dict[str, Any]]) -> Dict[str, str]:
+    async def llm_with_semaphore(
+        name: str,
+        results: List[Dict[str, Any]],
+        survey_decision: PreLlmSurveyDecision,
+    ) -> Dict[str, str]:
         async with llm_semaphore:
             return await asyncio.wait_for(
-                process_name_llm(name, results, debug=debug, dataset_profile=dataset_profile),
+                process_name_llm(
+                    name,
+                    results,
+                    debug=debug,
+                    dataset_profile=dataset_profile,
+                    pre_llm_decision=survey_decision,
+                ),
                 timeout=NAME_TIMEOUT
             )
     
     # Launch all LLM tasks in parallel (controlled by semaphore)
     llm_coroutines = [
-        llm_with_semaphore(name, search_results)
-        for name, search_results in llm_batch
+        llm_with_semaphore(name, search_results, survey_decision)
+        for name, search_results, survey_decision in llm_batch
     ]
     llm_outcomes = await asyncio.gather(*llm_coroutines, return_exceptions=True)
     
     # Process outcomes
     llm_results = []
-    for (name, search_results), outcome in zip(llm_batch, llm_outcomes):
+    for (name, search_results, survey_decision), outcome in zip(llm_batch, llm_outcomes):
         if isinstance(outcome, BaseException):
             error_msg = str(outcome)
             if "timeout" in error_msg.lower():
@@ -1186,6 +2402,7 @@ async def _process_llm_batch(llm_batch: List[tuple], debug: bool = False, datase
                 result = _build_error(error_msg)
             result["name"] = name
             result["institution"] = INSTITUTION
+            result = _apply_pre_llm_audit(result, survey_decision)
         else:
             result = outcome
             print(f"[LLM-BATCH] LLM succeeded for {name}")
@@ -1230,21 +2447,41 @@ async def _run_pipeline_dynamic_batching(
     search_batches = [names[i:i + search_batch_size] for i in range(0, total, search_batch_size)]
     
     # Accumulator for names needing LLM
-    llm_batch_accumulator: List[tuple] = []  # List of (name, search_results) tuples
+    llm_batch_accumulator: List[tuple[str, List[Dict[str, Any]], PreLlmSurveyDecision]] = []
     llm_batch_results_map: Dict[str, Dict[str, str]] = {}  # name -> LLM result
     
     # Track results in order (for skipped names, we add immediately; for LLM names, we add placeholder)
     result_order: List[str] = []  # Names in original order
     result_map: Dict[str, Dict[str, str]] = {}  # name -> result (for skipped)
+    survey_totals = {
+        SURVEY_HARD_NO: 0,
+        SURVEY_BORDERLINE: 0,
+        SURVEY_PLAUSIBLE: 0,
+        "rescue_used": 0,
+        "rescue_promoted": 0,
+    }
     
     # Create semaphore to limit concurrent searches
     search_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
 
     async def search_with_semaphore(name: str):
         # Add random jitter to prevent thundering herd
-        await asyncio.sleep(random.uniform(0.5, 2.0))
+        await asyncio.sleep(random.uniform(SEARCH_JITTER_MIN, SEARCH_JITTER_MAX))
         async with search_semaphore:
-             return await process_name_search(name, use_enhanced_search, debug=debug, dataset_profile=dataset_profile)
+             allow_recovery_fallback = _should_allow_slow_recovery_fallback(name)
+             allow_enhanced = use_enhanced_search and (_is_vip_name(name) or not VIP_ONLY_ENHANCED)
+             return await asyncio.wait_for(
+                 _run_staged_pre_llm_search(
+                     name,
+                     dataset_profile=dataset_profile,
+                     debug=debug,
+                     allow_enhanced=allow_enhanced,
+                     allow_bing_recovery_fallback=allow_recovery_fallback,
+                     allow_slow_ddg_recovery_fallback=allow_recovery_fallback,
+                     cache_enabled=False,
+                 ),
+                 timeout=SEARCH_TIMEOUT,
+             )
 
     # Process search batches
     for search_batch_idx, search_batch in enumerate(tqdm(search_batches, desc="Processing search batches", unit="batch"), 1):
@@ -1264,6 +2501,8 @@ async def _run_pipeline_dynamic_batching(
         
         # Process search results
         search_results_map: Dict[str, List[Dict[str, Any]]] = {}
+        search_decision_map: Dict[str, PreLlmSurveyDecision] = {}
+        search_metadata_map: Dict[str, Dict[str, Any]] = {}
         
         for name, outcome in zip(search_batch, search_outcomes):
             result_order.append(name)  # Track order
@@ -1276,11 +2515,24 @@ async def _run_pipeline_dynamic_batching(
                 error_result = _build_error(f"Search failed: {error_msg}")
                 error_result["name"] = name
                 error_result["institution"] = INSTITUTION
-                result_map[name] = error_result
+                result_map[name] = _apply_pre_llm_audit(error_result, None)
             else:
-                result_name, results = outcome
-                search_results_map[result_name] = results
-                print(f"[SEARCH] Search succeeded for {name}: {len(results)} results")
+                results, survey_decision, search_metadata = outcome
+                search_results_map[name] = results
+                search_decision_map[name] = survey_decision
+                search_metadata_map[name] = search_metadata
+                timing_basic = float(search_metadata.get("timing_basic_s", 0.0) or 0.0)
+                timing_rescue = float(search_metadata.get("timing_rescue_s", 0.0) or 0.0)
+                timing_enhanced = float(search_metadata.get("timing_enhanced_s", 0.0) or 0.0)
+                timing_total = float(search_metadata.get("timing_total_s", 0.0) or 0.0)
+                print(
+                    f"[SEARCH] Search succeeded for {name}: {len(results)} results "
+                    f"(mode={search_metadata.get('search_mode_used')}, queries={search_metadata.get('network_queries_used')}, "
+                    f"bucket={survey_decision.bucket}, t_basic={timing_basic:.1f}s, "
+                    f"t_rescue={timing_rescue:.1f}s, t_enh={timing_enhanced:.1f}s, t_total={timing_total:.1f}s)"
+                )
+
+        _print_search_metadata_summary("[SEARCH]", list(search_metadata_map.values()))
         
         # Phase 2: Skip evaluation and accumulation
         print(f"[SKIP-EVAL] Evaluating skip logic for {len(search_batch)} names (dataset_profile={dataset_profile})...")
@@ -1314,40 +2566,49 @@ async def _run_pipeline_dynamic_batching(
             if is_vip:
                 print(f"[VIP-TRACE] {name}: {len(results)} results, max_score={max_rel_score:.1f}, purdue_mentions={purdue_mentions}, .edu_hits={purdue_domain_hits}")
             
-            should_skip, skip_reason = should_skip_llm(results, dataset_profile=dataset_profile, name=name)
-            
+            surveyed_results = results
+            survey_decision = search_decision_map.get(name)
+            if survey_decision is None:
+                surveyed_results, survey_decision = await run_pre_llm_survey(
+                    name,
+                    results,
+                    dataset_profile=dataset_profile,
+                    debug=debug,
+                )
+            survey_totals[survey_decision.bucket] += 1
+            if survey_decision.used_rescue_query:
+                survey_totals["rescue_used"] += 1
+                if "rescue_query_promoted" in survey_decision.reason_codes:
+                    survey_totals["rescue_promoted"] += 1
+
             # VIP TRACING: Always log skip decision for VIP names
             if is_vip:
-                print(f"[VIP-TRACE] {name}: skip={should_skip}, reason={skip_reason}")
+                print(
+                    f"[VIP-TRACE] {name}: bucket={survey_decision.bucket}, "
+                    f"score={survey_decision.score}, reason={survey_decision.summary}"
+                )
             
-            if debug and not should_skip:
-                print(f"[SKIP-EVAL] {name}: NOT skipped (max_score={max_rel_score:.1f})")
+            if debug and survey_decision.bucket != SURVEY_HARD_NO:
+                print(f"[SKIP-EVAL] {name}: survey={survey_decision.bucket} (score={survey_decision.score})")
             
-            if should_skip:
-                skip_result = _build_immediate_not_connected(name, INSTITUTION, skip_reason or "No results found")
+            if survey_decision.bucket == SURVEY_HARD_NO:
+                skip_result = _build_immediate_not_connected(
+                    name,
+                    INSTITUTION,
+                    survey_decision.summary,
+                    pre_llm_decision=survey_decision,
+                )
                 result_map[name] = skip_result
                 skipped_count += 1
-                
-                # Enhanced logging: Show which tier/pattern triggered the skip
-                tier_marker = ""
-                if "Tier 1" in skip_reason:
-                    tier_marker = "[T1]"
-                elif "Tier 2" in skip_reason:
-                    tier_marker = "[T2]"
-                elif "Tier 3" in skip_reason:
-                    tier_marker = "[T3]"
-                elif "Tier 4" in skip_reason or "Confident negative" in skip_reason:
-                    tier_marker = "[T4]"
-                elif "negative evidence dominates" in skip_reason:
-                    tier_marker = "[NEG]"
-                else:
-                    tier_marker = "[SKIP]"
-                print(f"{tier_marker} Skipped: {name} - {skip_reason}")
+                print(f"[HARD-NO] Skipped: {name} - {survey_decision.summary}")
             else:
                 # Accumulate for LLM processing
-                llm_batch_accumulator.append((name, results))
+                llm_batch_accumulator.append((name, surveyed_results, survey_decision))
                 accumulated_count += 1
-                print(f"[ACCUM] Added {name} to LLM batch (accumulated: {len(llm_batch_accumulator)})")
+                print(
+                    f"[ACCUM] Added {name} to LLM batch as {survey_decision.bucket} "
+                    f"(accumulated: {len(llm_batch_accumulator)})"
+                )
         
         search_batch_elapsed = time.time() - search_batch_start
         print(f"[SEARCH-BATCH] Completed in {search_batch_elapsed:.1f}s - Skipped: {skipped_count}, Accumulated: {accumulated_count}")
@@ -1365,7 +2626,7 @@ async def _run_pipeline_dynamic_batching(
                 llm_results = await _process_llm_batch(current_llm_batch, debug=debug, dataset_profile=dataset_profile)
                 
                 # Store results in map
-                for (name, _), llm_result in zip(current_llm_batch, llm_results):
+                for (name, _, _), llm_result in zip(current_llm_batch, llm_results):
                     llm_batch_results_map[name] = llm_result
                 
                 print(f"[LLM-TRIGGER] Processed LLM batch, {len(llm_batch_accumulator)} names still accumulated")
@@ -1397,7 +2658,7 @@ async def _run_pipeline_dynamic_batching(
         # Inter-batch delay
         if search_batch_idx < len(search_batches):
             print(f"[PIPELINE] Waiting {inter_batch_delay}s before next search batch...")
-            await asyncio.sleep(inter_batch_delay)
+            await asyncio.sleep(min(inter_batch_delay, 0.1))
     
     # Phase 4: Flush remaining LLM batch
     if llm_batch_accumulator:
@@ -1405,7 +2666,7 @@ async def _run_pipeline_dynamic_batching(
         llm_results = await _process_llm_batch(llm_batch_accumulator, debug=debug, dataset_profile=dataset_profile)
         
         # Store results in map
-        for (name, _), llm_result in zip(llm_batch_accumulator, llm_results):
+        for (name, _, _), llm_result in zip(llm_batch_accumulator, llm_results):
             llm_batch_results_map[name] = llm_result
         
         llm_batch_accumulator = []
@@ -1422,7 +2683,7 @@ async def _run_pipeline_dynamic_batching(
             error_result = _build_error("Missing result - processing error")
             error_result["name"] = name
             error_result["institution"] = INSTITUTION
-            all_results.append(error_result)
+            all_results.append(_apply_pre_llm_audit(error_result, None))
             print(f"[ERROR] Missing result for {name}")
     
     total_elapsed = time.time() - start_time
@@ -1435,7 +2696,16 @@ async def _run_pipeline_dynamic_batching(
     print(f"[PIPELINE] Total time: {total_elapsed:.1f}s")
     print(f"[PIPELINE] Average per name: {avg:.1f}s")
     print(f"[PIPELINE] Total names: {total}")
+    skipped_total = survey_totals[SURVEY_HARD_NO]
     print(f"[PIPELINE] Skipped: {skipped_total} ({100*skipped_total/total:.1f}%)")
+    print(
+        f"[PIPELINE] Survey totals: hard_no={survey_totals[SURVEY_HARD_NO]}, "
+        f"borderline={survey_totals[SURVEY_BORDERLINE]}, plausible={survey_totals[SURVEY_PLAUSIBLE]}"
+    )
+    print(
+        f"[PIPELINE] Rescue usage: used={survey_totals['rescue_used']}, "
+        f"promoted={survey_totals['rescue_promoted']}"
+    )
     print(f"[PIPELINE] LLM processed: {llm_total} ({100*llm_total/total:.1f}%)")
     print(f"[PIPELINE] Total results: {len(all_results)}")
     
@@ -1540,7 +2810,7 @@ async def run_pipeline(names: List[str], batch_size: int, use_enhanced_search: b
                 error_result = _build_error(str(e))
                 error_result["name"] = name
                 error_result["institution"] = INSTITUTION
-                all_results.append(error_result)
+                all_results.append(_apply_pre_llm_audit(error_result, None))
         
         # Clean up resources between batches to prevent performance degradation
         if index < len(batches):  # Don't cleanup after the last batch

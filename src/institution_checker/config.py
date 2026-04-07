@@ -42,9 +42,36 @@ VIP_RESCUE_QUERIES = [
     '"{name}" Purdue (alumni OR visiting OR professor OR PhD)',
 ]
 
+# Pre-LLM plausibility survey configuration.
+# This stage reuses search results to decide whether a name is clearly implausible,
+# borderline (worth one cheap rescue query), or plausible enough to send to the LLM.
+PRE_LLM_SURVEY_ENABLED = True
+PRE_LLM_SURVEY_TRI_STATE = True
+PRE_LLM_SURVEY_VIP_BYPASS = True
+PRE_LLM_SURVEY_HARD_NO_THRESHOLD = 2
+PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD = 12
+PRE_LLM_SURVEY_ENABLE_BORDERLINE_RESCUE = True
+PRE_LLM_SURVEY_RESCUE_NUM_RESULTS = 8
+PRE_LLM_SURVEY_RESCUE_QUERY_TEMPLATE = (
+    'site:purdue.edu "{name}" '
+    '(professor OR faculty OR alumni OR student OR degree OR visiting OR postdoc OR researcher OR "summer program" OR "summer school")'
+)
+
+# Safety: connected verdicts must come from LLM judgment, not heuristic auto-rescue.
+ALLOW_HEURISTIC_POSITIVE_RESCUE = False
+
+# Low-connection trickle-down profile (for very large, sparse datasets).
+# These thresholds are used when dataset_profile includes "low".
+PRE_LLM_SURVEY_HARD_NO_THRESHOLD_LOW_CONNECTION = 6
+PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD_LOW_CONNECTION = 16
+
+# Require stronger evidence to pass to LLM on low-connection datasets.
+PRE_LLM_SURVEY_LOW_CONNECTION_REQUIRE_STRONG_DOMAIN = True
+PRE_LLM_SURVEY_LOW_CONNECTION_MIN_RELEVANCE_FOR_ESCALATION = 8
+
 # Page excerpt fetching limits (used before LLM analysis).
-LLM_EXCERPT_LIMIT = 6
-VIP_EXCERPT_LIMIT = 16
+LLM_EXCERPT_LIMIT = 10
+VIP_EXCERPT_LIMIT = 20
 
 # DuckDuckGo acceptance thresholds (lower = faster, higher = safer).
 DDG_MIN_RESULTS_DEFAULT = 3

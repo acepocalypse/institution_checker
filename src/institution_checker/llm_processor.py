@@ -23,7 +23,16 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-from .config import get_api_key, LLM_API_URL, MODEL_NAME, CURRENT_TERMS, PAST_TERMS, is_thinking_model, _contains_any
+from .config import (
+    ALLOW_HEURISTIC_POSITIVE_RESCUE,
+    CURRENT_TERMS,
+    LLM_API_URL,
+    MODEL_NAME,
+    PAST_TERMS,
+    _contains_any,
+    get_api_key,
+    is_thinking_model,
+)
 from .search import _institution_tokens
 
 _session: Optional[aiohttp.ClientSession] = None
@@ -31,8 +40,8 @@ _session_lock = asyncio.Lock()
 _last_refresh_time = 0.0
 _PROMPT_LOGGING_ENABLED = False
 
-MAX_RESULTS_FOR_PROMPT = 15 # Reduced from 18 for faster, more consistent responses
-VIP_RESULTS_FOR_PROMPT = 24
+MAX_RESULTS_FOR_PROMPT = 20
+VIP_RESULTS_FOR_PROMPT = 28
 
 # STRICT EVIDENCE-BASED PROMPT - Balanced for speed and accuracy
 PROMPT_TEMPLATE = """You are an evidence-driven verifier confirming whether {name} has a past or present relationship with {institution}. Read all {max_results} search findings below and decide if there is a real connection.
@@ -40,6 +49,7 @@ PROMPT_TEMPLATE = """You are an evidence-driven verifier confirming whether {nam
 CONNECTED: Return verdict="connected" ONLY when the evidence explicitly and directly shows:
 1. Alumni: Earned degree (Bachelor, Master, PhD, etc.) from the institution
 2. Attended: Enrolled/studied as a student (including "studied under") without earning a degree
+    - This includes short-form academic enrollment/training such as summer school, summer sessions, summer programs, or summer institutes at the institution
 3. Faculty: Teaching position, professor (including Distinguished/Emeritus), instructor, lecturer
 4. Staff: Administrative or research staff position (including Research Associate)
 5. Executive: President, dean, director, provost, chancellor role
@@ -52,13 +62,14 @@ STRICT EXCLUSIONS - These do NOT count as connections:
 - Honorary degrees or awards (unless accompanied by a real role like Professor or Alumnus)
 - Invited talks, seminars, or guest lectures (e.g., "Gave the XYZ Lecture at Purdue")
 - External advisory boards or consulting roles
-- Temporary event participation
+- Temporary event participation that does not involve enrollment/training status (e.g., conference attendance without student/trainee role)
 - Publications citing or mentioning the institution
 - Joint or affiliate campus mentions (e.g., IUPUI, IUPFW) unless the connection is explicitly to the main campus
 
 The person must have had a direct, institutional role or status (student, employee, degree-holder) at the institution. Brief mentions or publications held at a venue are NOT connections.
 
 Important: "Visiting Professor", "Visiting Scholar", and "Adjunct" roles ARE valid connections.
+Important: "attended summer school/session/program at {institution}" is a valid Attended connection when explicitly linked to {name}.
 
 Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the EXACT evidence that directly supports a connection.
 
@@ -160,14 +171,64 @@ _ALUMNI_TERMS = {
 _ATTENDED_TERMS = {
     "attended",
     "studied at",
+    "studied under",
     "studied in",
     "student at",
     "enrolled at",
     "enrolled in",
     "matriculated at",
     "went to",
+    "summer school at",
+    "summer session at",
+    "summer program at",
+    "summer institute at",
+    "summer student at",
+    "attended summer school",
+    "attended a summer program",
+    "attended summer program",
+}
+_SUMMER_ATTENDED_TERMS = {
+    "summer school",
+    "summer session",
+    "summer program",
+    "summer institute",
+    "summer student",
+    "summer course",
+    "summer courses",
 }
 _HONORARY_TERMS = ["honorary", "honoris causa"]
+_VISITING_TERMS = [
+    "visiting professor",
+    "visiting scholar",
+    "visiting fellow",
+]
+_FACULTY_TERMS = [
+    "professor at",
+    "faculty at",
+    "faculty member",
+    "served as professor",
+    "served as a professor",
+    "was professor",
+    "was a professor",
+    "held appointment",
+    "appointed professor",
+    "teaching position",
+    "lecturer at",
+    "instructor at",
+]
+_NON_RESCUE_CONTEXT_TERMS = [
+    "honorary",
+    "lecture",
+    "speaker",
+    "keynote",
+    "seminar",
+    "workshop",
+    "conference",
+    "symposium",
+    "guest lecture",
+    "advisory board",
+    "consultant",
+]
 
 
 def _coerce_message_text(value: Any) -> str:
@@ -489,6 +550,12 @@ def _classify_evidence_window(window_lower: str) -> Optional[str]:
         return None
     if any(term in window_lower for term in _HONORARY_TERMS):
         return None
+    if any(term in window_lower for term in _VISITING_TERMS):
+        return "Visiting"
+    if any(term in window_lower for term in _FACULTY_TERMS):
+        return "Faculty"
+    if any(term in window_lower for term in _SUMMER_ATTENDED_TERMS):
+        return "Attended"
     if any(term in window_lower for term in _ATTENDED_TERMS):
         return "Attended"
     if any(term in window_lower for term in _ALUMNI_TERMS):
@@ -498,6 +565,19 @@ def _classify_evidence_window(window_lower: str) -> Optional[str]:
     ):
         return "Alumni"
     return None
+
+
+def _looks_like_non_rescue_context(window_lower: str, evidence_type: Optional[str]) -> bool:
+    if not window_lower:
+        return False
+    # Summer attendance is a valid enrolled/training signal, not just event noise.
+    if evidence_type == "Attended" and any(term in window_lower for term in _SUMMER_ATTENDED_TERMS):
+        return False
+    if evidence_type == "Visiting":
+        filtered_terms = [term for term in _NON_RESCUE_CONTEXT_TERMS if term not in {"lecture", "speaker", "seminar"}]
+    else:
+        filtered_terms = _NON_RESCUE_CONTEXT_TERMS
+    return any(term in window_lower for term in filtered_terms)
 
 
 def _find_search_evidence(
@@ -534,11 +614,88 @@ def _find_search_evidence(
             window_lower = text_lower[start:end]
             evidence_type = _classify_evidence_window(window_lower)
             if evidence_type:
+                if _looks_like_non_rescue_context(window_lower, evidence_type):
+                    continue
                 window_original = text_original[start:end]
                 detail = _trim_evidence_text(window_original)
                 confidence = "high" if domain.endswith(".edu") else "medium"
                 return (evidence_type, detail, url, confidence)
     return None
+
+
+def _result_has_historical_role_evidence(result: Dict[str, Any]) -> bool:
+    text = _result_combined_text(result).lower()
+    if not text:
+        return False
+    evidence_type = _classify_evidence_window(text)
+    if not evidence_type:
+        return False
+    if _looks_like_non_rescue_context(text, evidence_type):
+        return False
+    return True
+
+
+def _result_has_historical_anchor_evidence(result: Dict[str, Any]) -> bool:
+    signals = result.get("signals") or {}
+    if any(
+        signals.get(key)
+        for key in (
+            "has_historical_role_anchor",
+            "has_historical_education_anchor",
+            "has_historical_profile_anchor",
+        )
+    ):
+        return True
+    return _result_has_historical_role_evidence(result)
+
+
+def _should_attempt_historical_llm_rescue(
+    decision: Dict[str, str],
+    institution: str,
+    results: List[Dict[str, Any]],
+    *,
+    vip_mode: bool = False,
+) -> bool:
+    if decision.get("connected") == "Y":
+        return False
+    if not results:
+        return False
+
+    authoritative_hits = 0
+    repeated_support = 0
+    role_hits = 0
+    for result in results:
+        url = _safe_text(result.get("url"))
+        domain = urlparse(url).netloc.lower() if url else ""
+        signals = result.get("signals") or {}
+        has_anchor = _result_has_historical_anchor_evidence(result)
+        if has_anchor:
+            role_hits += 1
+        if domain.endswith(".edu") and has_anchor:
+            authoritative_hits += 1
+        if (
+            signals.get("has_person_name")
+            and signals.get("has_institution")
+            and has_anchor
+        ):
+            repeated_support += 1
+
+    if authoritative_hits >= 1 and repeated_support >= 1:
+        return True
+    if role_hits >= 2 and repeated_support >= 2:
+        return True
+    return False
+
+
+def _result_prompt_priority(result: Dict[str, Any]) -> Tuple[int, int, int]:
+    signals = result.get("signals", {}) or {}
+    url = _safe_text(result.get("url"))
+    domain = urlparse(url).netloc.lower() if url else ""
+    role_priority = 1 if _result_has_historical_anchor_evidence(result) else 0
+    edu_priority = 1 if domain.endswith(".edu") else 0
+    explicit_priority = 1 if signals.get("has_explicit_connection") else 0
+    profile_priority = 1 if signals.get("has_historical_profile_anchor") else 0
+    return (role_priority + explicit_priority + profile_priority, edu_priority, signals.get("relevance_score", 0))
 
 
 def _has_institution_signal(results: Iterable[Dict[str, Any]], institution: str) -> bool:
@@ -861,8 +1018,17 @@ def _summarise_results(
     """
     rows = []
     result_count = 0
-    
-    for item in results:
+    ordered_results = sorted(
+        list(results),
+        key=lambda item: (
+            -_result_prompt_priority(item)[0],
+            -_result_prompt_priority(item)[1],
+            -_result_prompt_priority(item)[2],
+            item.get("rank", 9999),
+        ),
+    )
+
+    for item in ordered_results:
         # Skip low-quality results (ads, irrelevant content, weak mentions)
         # Threshold lowered to 8 to capture more context
         signals = item.get("signals", {}) or {}
@@ -1630,9 +1796,20 @@ def _auto_rescue_decision(
     name: str,
     institution: str,
     results: List[Dict[str, Any]],
+    *,
+    vip_mode: bool = False,
 ) -> Optional[Dict[str, str]]:
     """If the LLM said no connection, try to rescue using deterministic evidence."""
+    if not ALLOW_HEURISTIC_POSITIVE_RESCUE:
+        return None
     if decision.get("connected") == "Y":
+        return None
+    if not _should_attempt_historical_llm_rescue(
+        decision,
+        institution,
+        results,
+        vip_mode=vip_mode,
+    ):
         return None
     evidence = _find_search_evidence(name, institution, results)
     if not evidence:
@@ -2001,14 +2178,19 @@ async def analyze_connection(
                     merged = f"{existing_evidence}; {note}" if existing_evidence else note
                     decision["temporal_context"] = merged
                     decision["temporal_evidence"] = merged
-            
-            # Disabled: Trust LLM decision 99.9% of the time
-            # elif decision.get("connected") != "Y":
-            #     rescued = _auto_rescue_decision(decision, name, institution, results or [])
-            #     if rescued:
-            #         if debug:
-            #             print(f"[LLM] Auto-rescued connection using deterministic evidence: {rescued}")
-            #         return rescued
+
+            if decision.get("connected") != "Y":
+                rescued = _auto_rescue_decision(
+                    decision,
+                    name,
+                    institution,
+                    results or [],
+                    vip_mode=vip_mode,
+                )
+                if rescued:
+                    if debug:
+                        print(f"[LLM] Auto-rescued connection using deterministic evidence: {rescued}")
+                    return rescued
             
             if debug:
                 print(f"[LLM] Analysis complete: {decision}")
@@ -2032,12 +2214,17 @@ async def analyze_connection(
 
     # Failed after retries
     error_result = _build_error(last_error or "LLM analysis failed")
-    # Disabled: Trust LLM, only rescue on complete failure as last resort
-    # rescue_on_error = _auto_rescue_decision({"connected": "N"}, name, institution, results or [])
-    # if rescue_on_error:
-    #     if debug:
-    #         print("[LLM] Auto-rescued connection after error using deterministic evidence")
-    #     return rescue_on_error
+    rescue_on_error = _auto_rescue_decision(
+        {"connected": "N"},
+        name,
+        institution,
+        results or [],
+        vip_mode=vip_mode,
+    )
+    if rescue_on_error:
+        if debug:
+            print("[LLM] Auto-rescued connection after error using deterministic evidence")
+        return rescue_on_error
     if debug:
         print(f"[LLM] All attempts failed, returning error result")
     return error_result

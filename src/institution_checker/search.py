@@ -130,6 +130,13 @@ EXPLICIT_CONNECTION_PHRASES = [
     "alumni of",
     "studied at",
     "student at",
+    "summer school at",
+    "summer session at",
+    "summer program at",
+    "summer institute at",
+    "summer student at",
+    "attended summer school at",
+    "attended a summer program at",
 ]
 
 # Event/prize patterns (reduce false positives)
@@ -168,8 +175,202 @@ YEAR_WINDOW = range(_CURRENT_YEAR - 12, _CURRENT_YEAR + 1)
 RECENT_YEAR_STRINGS = {str(_CURRENT_YEAR - offset) for offset in range(0, 3)}
 
 DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
+
+
+@dataclass
+class ValidationSearchContext:
+    """Shared context for staged validation search calls.
+
+    Keeps lightweight cache/telemetry so the staged pre-LLM pipeline can
+    aggregate cache and backend usage across basic/rescue/enhanced phases.
+    """
+
+    cache_enabled: bool = True
+    allow_bing_fallback: bool = False
+    allow_slow_ddg_fallback: bool = False
+    cache: Dict[str, List[Dict[str, object]]] = None
+    cache_hits: int = 0
+    cache_misses: int = 0
+    backend_hits: Dict[str, int] = None
+
+    def __post_init__(self) -> None:
+        if self.cache is None:
+            self.cache = {}
+        if self.backend_hits is None:
+            self.backend_hits = {"cache": 0, "ddg": 0, "bing": 0, "enhanced": 0}
+
+
+def _validation_cache_key(
+    query: str,
+    institution: str,
+    person_name: str,
+    limit: int,
+    ensure_tokens: bool,
+) -> str:
+    return "||".join(
+        [
+            _normalise_whitespace(query).lower(),
+            _normalise_whitespace(institution).lower(),
+            _normalise_whitespace(person_name).lower(),
+            str(limit),
+            "1" if ensure_tokens else "0",
+        ]
+    )
+
+
+async def validation_search_query(
+    query: str,
+    *,
+    institution: str,
+    person_name: str,
+    limit: int,
+    debug: bool = False,
+    context: Optional[ValidationSearchContext] = None,
+    prefer_backend: str = "ddg",
+    allow_bing_fallback: bool = False,
+    allow_slow_ddg_fallback: bool = False,
+    ensure_tokens: bool = True,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    ctx = context or ValidationSearchContext()
+    cache_key = _validation_cache_key(query, institution, person_name, limit, ensure_tokens)
+
+    if ctx.cache_enabled and cache_key in ctx.cache:
+        ctx.cache_hits += 1
+        ctx.backend_hits["cache"] = ctx.backend_hits.get("cache", 0) + 1
+        return list(ctx.cache[cache_key]), {
+            "backend_used": "cache",
+            "cache_hit": True,
+            "network_queries_used": 0,
+            "ddg_manual_retry_used": False,
+            "ddg_browser_fallback_used": False,
+            "bing_fallback_used": False,
+            "network_attempt_count": 0,
+        }
+
+    ctx.cache_misses += 1
+    effective_allow_bing = allow_bing_fallback or ctx.allow_bing_fallback
+    effective_allow_slow = allow_slow_ddg_fallback or ctx.allow_slow_ddg_fallback
+
+    if prefer_backend == "enhanced":
+        results = await enhanced_search(
+            person_name or query,
+            institution=institution,
+            num_results=limit,
+            debug=debug,
+            fetch_excerpts=False,
+        )
+        backend = "enhanced"
+        ctx.backend_hits["enhanced"] = ctx.backend_hits.get("enhanced", 0) + 1
+        ddg_manual_retry_used = False
+        ddg_browser_fallback_used = False
+        bing_fallback_used = False
+    else:
+        results = await bing_search(
+            query,
+            num_results=limit,
+            institution=institution,
+            person_name=person_name,
+            debug=debug,
+            allow_fallback=True,
+            fetch_excerpts=False,
+            ensure_tokens=ensure_tokens,
+        )
+        backend = "ddg"
+        if effective_allow_bing:
+            backend = "ddg|bing"
+        ctx.backend_hits["ddg"] = ctx.backend_hits.get("ddg", 0) + 1
+        if effective_allow_bing:
+            ctx.backend_hits["bing"] = ctx.backend_hits.get("bing", 0) + 1
+        ddg_manual_retry_used = bool(effective_allow_slow)
+        ddg_browser_fallback_used = False
+        bing_fallback_used = bool(effective_allow_bing)
+
+    if ctx.cache_enabled:
+        ctx.cache[cache_key] = list(results)
+
+    return results, {
+        "backend_used": backend,
+        "cache_hit": False,
+        "network_queries_used": 1,
+        "ddg_manual_retry_used": ddg_manual_retry_used,
+        "ddg_browser_fallback_used": ddg_browser_fallback_used,
+        "bing_fallback_used": bing_fallback_used,
+        "network_attempt_count": 1,
+    }
+
+
+async def validation_basic_search(
+    name: str,
+    institution: str,
+    *,
+    debug: bool = False,
+    context: Optional[ValidationSearchContext] = None,
+    allow_bing_fallback: bool = False,
+    allow_slow_ddg_fallback: bool = False,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    query = f'"{name}" "{institution}"'
+    return await validation_search_query(
+        query,
+        institution=institution,
+        person_name=name,
+        limit=20,
+        debug=debug,
+        context=context,
+        prefer_backend="ddg",
+        allow_bing_fallback=allow_bing_fallback,
+        allow_slow_ddg_fallback=allow_slow_ddg_fallback,
+        ensure_tokens=True,
+    )
+
+
+async def validation_enhanced_search(
+    name: str,
+    institution: str,
+    *,
+    debug: bool = False,
+    context: Optional[ValidationSearchContext] = None,
+    allow_bing_fallback: bool = False,
+    allow_slow_ddg_fallback: bool = False,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    ctx = context or ValidationSearchContext()
+    cache_key = _validation_cache_key(name, institution, name, 30, False)
+
+    if ctx.cache_enabled and cache_key in ctx.cache:
+        ctx.cache_hits += 1
+        ctx.backend_hits["cache"] = ctx.backend_hits.get("cache", 0) + 1
+        return list(ctx.cache[cache_key]), {
+            "backend_used": "cache",
+            "cache_hit": True,
+            "network_queries_used": 0,
+            "ddg_manual_retry_used": False,
+            "ddg_browser_fallback_used": False,
+            "bing_fallback_used": False,
+            "network_attempt_count": 0,
+        }
+
+    ctx.cache_misses += 1
+    results = await enhanced_search(
+        name,
+        institution=institution,
+        num_results=30,
+        debug=debug,
+        fetch_excerpts=False,
+    )
+    if ctx.cache_enabled:
+        ctx.cache[cache_key] = list(results)
+    ctx.backend_hits["enhanced"] = ctx.backend_hits.get("enhanced", 0) + 1
+
+    return results, {
+        "backend_used": "enhanced",
+        "cache_hit": False,
+        "network_queries_used": 1,
+        "ddg_manual_retry_used": bool(allow_slow_ddg_fallback or ctx.allow_slow_ddg_fallback),
+        "ddg_browser_fallback_used": False,
+        "bing_fallback_used": bool(allow_bing_fallback or ctx.allow_bing_fallback),
+        "network_attempt_count": 1,
+    }
 BING_URL = "https://www.bing.com/search"
-EXCERPT_FETCH_LIMIT = 8  # Increased from 4 to ensure we get evidence for top results
+EXCERPT_FETCH_LIMIT = 16  # Increased from 4 to ensure we get evidence for top results
 EXCERPT_HTTP_TIMEOUT = 6.0  # seconds (reduced for speed)
 EXCERPT_MAX_CHARS = 800  # Increased from 600 to capture more context
 _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
@@ -1179,6 +1380,8 @@ async def _fetch_with_httpx(query: str, count: int, debug: bool = False) -> str:
 
 # Global semaphore for DuckDuckGo to prevent rate limiting
 _ddg_semaphore = asyncio.Semaphore(3)
+DDG_LIBRARY_TIMEOUT = 20.0
+DDG_STAGE_SOFT_TIMEOUT = 12.0
 
 _DDG_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1213,7 +1416,10 @@ async def _duckduckgo_search(
             loop = asyncio.get_running_loop()
             async with _ddg_semaphore:
                 # Use executor to avoid blocking the event loop
-                ddg_results = await loop.run_in_executor(None, _run_ddgs)
+                ddg_results = await asyncio.wait_for(
+                    loop.run_in_executor(None, _run_ddgs),
+                    timeout=DDG_LIBRARY_TIMEOUT,
+                )
             
             if debug:
                  print(f"[search] duckduckgo_search library returned {len(ddg_results)} raw results")
@@ -1252,6 +1458,9 @@ async def _duckduckgo_search(
                      print(f"[search] duckduckgo_search library yielded {len(results)} valid results")
                  return results
                  
+        except asyncio.TimeoutError:
+            if debug:
+                print(f"[search] duckduckgo_search library timed out after {DDG_LIBRARY_TIMEOUT:.0f}s, falling back to manual scraping")
         except Exception as e:
             if debug:
                 print(f"[search] duckduckgo_search library failed, falling back to manual scraping: {e}")
@@ -2057,19 +2266,32 @@ async def bing_search(
     if ensure_tokens:
         query = _ensure_name_and_institution(query, person_name, institution)
     target = max(num_results, 10)
+    ddg_prefetched: List[Dict[str, object]] = []
     
     # STRATEGY UPDATE: Prioritize DuckDuckGo for speed and reliability (avoids Bing blocks)
     # This helps meet the <4s per name target and improves recall on blocked queries.
     if allow_fallback:
         if debug:
             print("[search] Attempting DuckDuckGo first for speed/reliability...")
-        ddg_results = await _duckduckgo_search(
-            query,
-            institution=institution,
-            person_name=person_name,
-            limit=max(num_results, 20),
-            debug=debug,
-        )
+        try:
+            ddg_results = await asyncio.wait_for(
+                _duckduckgo_search(
+                    query,
+                    institution=institution,
+                    person_name=person_name,
+                    limit=max(num_results, 20),
+                    debug=debug,
+                ),
+                timeout=DDG_STAGE_SOFT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            if debug:
+                print(
+                    f"[search] DDG stage soft timeout after {DDG_STAGE_SOFT_TIMEOUT:.0f}s; "
+                    "continuing with Bing path"
+                )
+            ddg_results = []
+        ddg_prefetched = ddg_results
         
         # If DDG gives good results, use them and skip slow Bing scraping
         if ddg_results and (
@@ -2119,7 +2341,12 @@ async def bing_search(
     # Since we moved DDG to the front, we don't need the post-search fallback as much.
     
     prepared = _prepare_ranked_results(results)
-    prepared = _prioritize_target_hits(prepared, person_name, institution)
+    if ddg_prefetched:
+        merged = _prepare_ranked_results(list(ddg_prefetched) + prepared)
+        prepared = _prioritize_target_hits(merged, person_name, institution)
+    else:
+        prepared = _prioritize_target_hits(prepared, person_name, institution)
+
     top_results = prepared[:num_results]
     if top_results and fetch_excerpts:
         await _enrich_with_page_excerpts(top_results, person_name, limit=min(EXCERPT_FETCH_LIMIT, len(top_results)))
