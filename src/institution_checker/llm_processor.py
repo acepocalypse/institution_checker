@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import ssl
 import sys
 import time
 from datetime import datetime
@@ -70,6 +71,7 @@ The person must have had a direct, institutional role or status (student, employ
 
 Important: "Visiting Professor", "Visiting Scholar", and "Adjunct" roles ARE valid connections.
 Important: "attended summer school/session/program at {institution}" is a valid Attended connection when explicitly linked to {name}.
+Critical identity rule: Evidence must refer to {name}. If evidence clearly refers to a different person, return not_connected.
 
 Prefer authoritative sources (.edu, official bios/CVs, reputable news). Quote the EXACT evidence that directly supports a connection.
 
@@ -121,6 +123,12 @@ UNTIL_PATTERN = re.compile(r'\b(?:until|through|ended\s+in|retired\s+in|left\s+i
 
 _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
 _EVIDENCE_WINDOW_CHARS = 220
+
+
+class RetryableLLMError(RuntimeError):
+    """Raised for transient LLM API responses that should be retried."""
+
+
 _DEGREE_VERBS = [
     "graduated",
     "graduate",
@@ -536,6 +544,76 @@ def _result_mentions_person(result: Dict[str, Any], name_tokens: List[str]) -> b
             return False
     
     return True
+
+
+def _result_mentions_person_strict(result: Dict[str, Any], name_tokens: List[str]) -> bool:
+    """Strict person-match check used to validate positive LLM decisions.
+
+    Requires a reliable last-name match plus first-name/initial support.
+    """
+    if not name_tokens:
+        return False
+
+    text = _normalize_simple(_result_combined_text(result))
+    url_text = _normalize_simple(_safe_text(result.get("url")))
+    haystack = f"{text} {url_text}".strip()
+    if not haystack:
+        return False
+
+    last_token = name_tokens[-1]
+    first_token = name_tokens[0]
+
+    if len(last_token) <= 2:
+        return False
+    if last_token not in haystack:
+        return False
+
+    if len(first_token) > 1 and first_token in haystack:
+        return True
+
+    first_initial = first_token[:1]
+    if first_initial:
+        initial_last = re.compile(rf"\b{re.escape(first_initial)}\.?\s+{re.escape(last_token)}\b")
+        if initial_last.search(haystack):
+            return True
+
+    for token in name_tokens[1:-1]:
+        if len(token) > 2 and token in haystack:
+            return True
+
+    return False
+
+
+def _decision_mentions_target_person(
+    decision: Dict[str, str],
+    name: str,
+    results: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Verify connected evidence appears to reference the target person."""
+    name_tokens = _tokenize_name(name)
+    if not name_tokens:
+        return True
+
+    detail = _safe_text(decision.get("verification_detail"))
+    summary = _safe_text(decision.get("summary"))
+    primary_source = _safe_text(decision.get("primary_source") or decision.get("supporting_url"))
+    decision_text = _normalize_simple(f"{detail} {summary} {primary_source}")
+
+    if decision_text:
+        synthetic_result = {
+            "title": summary,
+            "snippet": detail,
+            "page_excerpt": detail,
+            "url": primary_source,
+        }
+        if _result_mentions_person_strict(synthetic_result, name_tokens):
+            return True
+
+    for result in (results or [])[:10]:
+        if _result_mentions_person_strict(result, name_tokens):
+            return True
+
+    return False
 
 
 def _trim_evidence_text(text: str) -> str:
@@ -1257,6 +1335,47 @@ def _parse_response(raw: str) -> Dict[str, Any]:
     )
 
 
+def _format_llm_response_diagnostics(response: aiohttp.ClientResponse, body_text: str = "") -> str:
+    """Extract request/rate-limit diagnostics from provider responses."""
+    try:
+        headers = response.headers or {}
+    except Exception:
+        headers = {}
+
+    def _first_header(*names: str) -> str:
+        for name in names:
+            value = headers.get(name)
+            if value:
+                return str(value)
+        return ""
+
+    request_id = _first_header("x-request-id", "request-id", "openai-request-id")
+    retry_after = _first_header("retry-after")
+    rpm_limit = _first_header("x-ratelimit-limit-requests")
+    rpm_remaining = _first_header("x-ratelimit-remaining-requests")
+    rpm_reset = _first_header("x-ratelimit-reset-requests")
+
+    parts: List[str] = []
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    if retry_after:
+        parts.append(f"retry_after={retry_after}")
+    if rpm_limit:
+        parts.append(f"rpm_limit={rpm_limit}")
+    if rpm_remaining:
+        parts.append(f"rpm_remaining={rpm_remaining}")
+    if rpm_reset:
+        parts.append(f"rpm_reset={rpm_reset}")
+
+    stripped = (body_text or "").strip().lower()
+    if stripped == "null":
+        parts.append("provider_body=null")
+    if "rate limit" in stripped or "too many requests" in stripped:
+        parts.append("rate_limit_text_detected=true")
+
+    return ", ".join(parts) if parts else "no_diagnostics"
+
+
 async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
     """Call LLM with temperature 0 for fully deterministic outputs."""
     session = await get_session()
@@ -1274,6 +1393,7 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,  # Deterministic output
+        "response_format": {"type": "json_object"},
         "stream": False,
     }
 
@@ -1282,95 +1402,110 @@ async def _call_llm(prompt: str, debug: bool = False) -> Dict[str, Any]:
     last_error_text: Optional[str] = None
     
     # Make single API call with provided temperature
-    async with session.post(LLM_API_URL, json=payload, headers=headers) as response:
-        text = await response.text()
-        last_error_text = text
+    try:
+        async with session.post(LLM_API_URL, json=payload, headers=headers) as response:
+            text = await response.text()
+            last_error_text = text
+            diagnostics = _format_llm_response_diagnostics(response, text)
 
-        if debug:
-            print(f"[LLM] Response status: {response.status}")
-            print(f"[LLM] Response length: {len(text)} chars")
-
-        if response.status >= 500:
-            raise RuntimeError(f"LLM server error {response.status}: {text[:200]}")
-
-        if response.status >= 400:
-            raise RuntimeError(f"LLM request failed ({response.status}): {text[:200]}")
-
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
             if debug:
-                print("[LLM] Failed to parse server response as JSON")
-            raise RuntimeError(f"Invalid JSON from server: {exc}") from exc
+                print(f"[LLM] Response status: {response.status}")
+                print(f"[LLM] Response length: {len(text)} chars")
+
+            if response.status >= 500:
+                raise RetryableLLMError(
+                    f"LLM server error {response.status}: {text[:200]} (diag: {diagnostics})"
+                )
+
+            if response.status == 429:
+                raise RetryableLLMError(
+                    f"LLM rate limited (429): {text[:200]} (diag: {diagnostics})"
+                )
+
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"LLM request failed ({response.status}): {text[:200]} (diag: {diagnostics})"
+                )
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                if debug:
+                    print("[LLM] Failed to parse server response as JSON")
+                raise RetryableLLMError(f"Invalid JSON from server: {exc}") from exc
         
-        # Defensive check: ensure data is a dict (not null/list/other type)
-        if not isinstance(data, dict):
+            # Defensive check: ensure data is a dict (not null/list/other type)
+            if not isinstance(data, dict):
+                if debug:
+                    print(f"[LLM] ERROR: Response is not a dict, it's a {type(data).__name__}")
+                    print(f"[LLM] Raw response text preview: {text[:200]}")
+                raise RetryableLLMError(
+                    f"LLM response is not a JSON object: got {type(data).__name__}"
+                    f" (raw_text={text[:80]!r}, diag: {diagnostics})"
+                )
+        
+            # Debug: Print full API response structure
             if debug:
-                print(f"[LLM] ERROR: Response is not a dict, it's a {type(data).__name__}")
-                print(f"[LLM] Raw response text preview: {text[:200]}")
-            # Mark as transient to make upstream retries/logging clearer.
-            raise RuntimeError(
-                f"LLM response is not a JSON object: got {type(data).__name__}"
-                f" (raw_text={text[:80]!r})"
-            )
-        
-        # Debug: Print full API response structure
-        if debug:
-            print(f"[LLM DEBUG] Full API response keys: {list(data.keys())}")
-            print(f"[LLM DEBUG] Full API response: {json.dumps(data, indent=2)}")
+                print(f"[LLM DEBUG] Full API response keys: {list(data.keys())}")
+                print(f"[LLM DEBUG] Full API response: {json.dumps(data, indent=2)}")
 
-        choices = data.get("choices") or []
-        if not choices:
+            choices = data.get("choices") or []
+            if not choices:
+                if debug:
+                    print("[LLM] No choices in response")
+                raise RetryableLLMError("LLM response contained no choices")
+
+            first_choice = choices[0] if choices else {}
+            if not isinstance(first_choice, dict):
+                raise RuntimeError(f"LLM choice is not a JSON object: got {type(first_choice).__name__}")
+
+            message = first_choice.get("message", {})
+            if not isinstance(message, dict):
+                raise RuntimeError(f"LLM message is not a JSON object: got {type(message).__name__}")
+        
+            # Debug: Print the entire message structure
             if debug:
-                print("[LLM] No choices in response")
-            raise RuntimeError("LLM response contained no choices")
-
-        first_choice = choices[0] if choices else {}
-        if not isinstance(first_choice, dict):
-            raise RuntimeError(f"LLM choice is not a JSON object: got {type(first_choice).__name__}")
-
-        message = first_choice.get("message", {})
-        if not isinstance(message, dict):
-            raise RuntimeError(f"LLM message is not a JSON object: got {type(message).__name__}")
+                print(f"[LLM DEBUG] Message keys: {list(message.keys())}")
+                print(f"[LLM DEBUG] Full message structure: {json.dumps(message, indent=2)}")
         
-        # Debug: Print the entire message structure
-        if debug:
-            print(f"[LLM DEBUG] Message keys: {list(message.keys())}")
-            print(f"[LLM DEBUG] Full message structure: {json.dumps(message, indent=2)}")
+            # Extract content from both thinking and non-thinking models
+            content, reasoning = _extract_response_content(message, debug=debug)
+            content_stripped = content.strip() if content else ""
         
-        # ✅ NEW: Extract content from both thinking and non-thinking models
-        content, reasoning = _extract_response_content(message, debug=debug)
-        content_stripped = content.strip() if content else ""
-        
-        if debug:
-            if reasoning:
-                print(f"[LLM] Reasoning length: {len(reasoning)} chars")
-                print(f"[LLM] Reasoning preview: {reasoning[:300]}...")
-            print(f"[LLM] Content length: {len(content_stripped)} chars")
-            if len(content_stripped) < 500:
-                print(f"[LLM] Full content: {content_stripped}")
-            else:
-                print(f"[LLM] Content preview: {content_stripped[:300]}...")
-            if not content_stripped.endswith("}"):
-                print("[LLM] ⚠️  WARNING: Response doesn't end with }, likely TRUNCATED")
-                print(f"[LLM] Last 200 chars: ...{content_stripped[-200:]}")
-
-        if debug or _PROMPT_LOGGING_ENABLED:
-            separator = "=" * 48
-            if reasoning:
-                print(f"{separator}\n[LLM REASONING]\n{separator}")
-                print(reasoning)
-                print(f"{separator}\n[END REASONING]\n{separator}")
-            print(f"{separator}\n[LLM RESPONSE (JSON)]\n{separator}")
-            print(content_stripped)
-            print(f"{separator}\n[END RESPONSE]\n{separator}")
-
-        if not content_stripped:
             if debug:
-                print(f"[LLM] Empty content received from API")
-            raise RuntimeError("LLM returned empty content")
+                if reasoning:
+                    print(f"[LLM] Reasoning length: {len(reasoning)} chars")
+                    print(f"[LLM] Reasoning preview: {reasoning[:300]}...")
+                print(f"[LLM] Content length: {len(content_stripped)} chars")
+                if len(content_stripped) < 500:
+                    print(f"[LLM] Full content: {content_stripped}")
+                else:
+                    print(f"[LLM] Content preview: {content_stripped[:300]}...")
+                if not content_stripped.endswith("}"):
+                    print("[LLM] WARNING: Response doesn't end with }, likely TRUNCATED")
+                    print(f"[LLM] Last 200 chars: ...{content_stripped[-200:]}")
 
-        return _parse_response(content_stripped)
+            if debug or _PROMPT_LOGGING_ENABLED:
+                separator = "=" * 48
+                if reasoning:
+                    print(f"{separator}\n[LLM REASONING]\n{separator}")
+                    print(reasoning)
+                    print(f"{separator}\n[END REASONING]\n{separator}")
+                print(f"{separator}\n[LLM RESPONSE (JSON)]\n{separator}")
+                print(content_stripped)
+                print(f"{separator}\n[END RESPONSE]\n{separator}")
+
+            if not content_stripped:
+                if debug:
+                    print(f"[LLM] Empty content received from API")
+                raise RetryableLLMError("LLM returned empty content")
+
+            return _parse_response(content_stripped)
+    except (aiohttp.ClientError, ssl.SSLError, OSError) as exc:
+        message = str(exc)
+        if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in message or "SSL" in message.upper():
+            raise RetryableLLMError(f"Transient SSL transport error: {message}") from exc
+        raise RetryableLLMError(f"Transient transport error: {message}") from exc
 
 
 def _extract_domain(url: str) -> str:
@@ -1829,7 +1964,12 @@ def _auto_rescue_decision(
     return _normalize_decision(raw_payload)
 
 
-def _validate_decision(decision: Dict[str, str], name: str, institution: str) -> bool:
+def _validate_decision(
+    decision: Dict[str, str],
+    name: str,
+    institution: str,
+    results: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
     """Validate that the decision makes logical sense."""
     verdict = decision.get("verdict", "")
     if verdict not in {"connected", "not_connected", "uncertain"}:
@@ -1898,6 +2038,8 @@ def _validate_decision(decision: Dict[str, str], name: str, institution: str) ->
         if "error" in detail.lower() or "error" in summary.lower():
             return False
         if relationship_timeframe not in {"current", "past", "unknown"}:
+            return False
+        if not _decision_mentions_target_person(decision, name, results):
             return False
     else:
         if relationship_timeframe not in {"unknown"}:
@@ -2094,10 +2236,13 @@ async def analyze_connection(
 
     last_error: Optional[str] = None
     
-    for attempt in range(1, max_retries + 1):
+    extra_transient_retries = 2
+    max_total_attempts = max_retries + extra_transient_retries
+
+    for attempt in range(1, max_total_attempts + 1):
         try:
             if debug and attempt > 1:
-                print(f"[LLM] Retry attempt {attempt}/{max_retries}")
+                print(f"[LLM] Retry attempt {attempt}/{max_total_attempts}")
             
             # Add per-attempt timeout with exponential backoff
             timeout = per_attempt_timeout * (1.5 ** (attempt - 1))  # Increase timeout on retries
@@ -2123,7 +2268,7 @@ async def analyze_connection(
             decision = _normalize_decision(parsed)
             
             # Validate decision
-            if not _validate_decision(decision, name, institution):
+            if not _validate_decision(decision, name, institution, results):
                 if debug:
                     print(f"[LLM] Decision failed validation: {decision}")
                 if attempt < max_retries:
@@ -2198,13 +2343,20 @@ async def analyze_connection(
             return decision
             
         except Exception as exc:
-            last_error = str(exc)
+            last_error = str(exc) or f"{exc.__class__.__name__}: {exc!r}"
             if debug:
                 print(f"[LLM] Attempt {attempt} failed: {exc}")
-            
-            if attempt < max_retries:
-                # Exponential backoff
-                delay = min(1.5 * attempt, 4.0)
+
+            retryable = isinstance(exc, RetryableLLMError)
+            can_standard_retry = attempt < max_retries
+            can_extra_transient_retry = retryable and attempt < max_total_attempts
+
+            if can_standard_retry or can_extra_transient_retry:
+                # Longer backoff for transient provider-side issues
+                if retryable:
+                    delay = min(2.0 * attempt, 6.0)
+                else:
+                    delay = min(1.5 * attempt, 4.0)
                 if debug:
                     print(f"[LLM] Waiting {delay}s before retry...")
                 await asyncio.sleep(delay)

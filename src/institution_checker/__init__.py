@@ -15,7 +15,11 @@ Usage examples:
     from institution_checker import run_pipeline, expand_results_to_source
 """
 
-from .main import run_pipeline  # noqa: F401
+from .main import (  # noqa: F401
+    expand_cluster_results_identity_safe,
+    run_pipeline,
+    run_targeted_recovery_pass,
+)
 from .search import close_search_clients  # noqa: F401
 from .llm_processor import close_session  # noqa: F401
 from .config import INSTITUTION, set_api_key  # noqa: F401
@@ -32,6 +36,8 @@ from .nb_utils import (  # noqa: F401
 
 __all__ = [
     "run_pipeline",
+    "expand_cluster_results_identity_safe",
+    "run_targeted_recovery_pass",
     "close_search_clients",
     "close_session",
     "INSTITUTION",

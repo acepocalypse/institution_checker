@@ -68,6 +68,26 @@ MAX_CONCURRENT_SEARCHES = 16  # higher search parallelism for low-connection bul
 SEARCH_JITTER_MIN = 0.05
 SEARCH_JITTER_MAX = 0.25
 
+DEFAULT_CLUSTER_RESULT_FIELDS: List[str] = [
+    "institution",
+    "verdict",
+    "relationship_type",
+    "relationship_timeframe",
+    "verification_detail",
+    "summary",
+    "primary_source",
+    "verification_status",
+    "temporal_context",
+    "confidence",
+    "purdue_connection",
+    "pre_llm_bucket",
+    "pre_llm_stage",
+    "pre_llm_score",
+    "pre_llm_summary",
+    "pre_llm_reason_codes",
+    "pre_llm_used_rescue_query",
+]
+
 STRONG_POSITIVE_SIGNAL_KEYWORDS: List[str] = [
     "faculty",
     "professor",
@@ -114,6 +134,11 @@ STRONG_POSITIVE_SIGNAL_KEYWORDS: List[str] = [
     "postdoctoral fellow",
     "postdoctoral fellowship",
     "researcher",
+    "president",
+    "chancellor",
+    "provost",
+    "director",
+    "executive",
     "dean",
     "chair",
     "visiting professor",
@@ -414,12 +439,23 @@ def should_attempt_validation_rescue(
 def should_attempt_validation_enhanced(
     name: str,
     decision: PreLlmSurveyDecision,
+    dataset_profile: str = None,
 ) -> tuple[bool, str, str]:
     metrics = decision.metrics or {}
     subtype, _ = classify_validation_borderline(name, decision)
+    low_connection_profile = _is_low_connection_profile(dataset_profile)
     if decision.bucket == SURVEY_PLAUSIBLE:
         return False, "already_plausible", subtype
     if decision.bucket != SURVEY_BORDERLINE:
+        # Recall-first recovery for high-connection datasets:
+        # if basic search came back empty and we hard-rejected early,
+        # run one enhanced search pass before final hard_no.
+        if (
+            not low_connection_profile
+            and metrics.get("result_count", 0) == 0
+            and "no_results" in decision.reason_codes
+        ):
+            return True, "empty_search_recovery", "borderline_likely_positive"
         if metrics.get("explicit_connection_hits", 0) > 0:
             return True, "explicit_connection_without_promotion", "borderline_likely_positive"
         if metrics.get("weak_profile_anchor_hits", 0) > 0:
@@ -428,6 +464,19 @@ def should_attempt_validation_enhanced(
             return True, "historical_anchor_without_promotion", "borderline_likely_positive"
         return False, "obvious_negative", subtype
     if metrics.get("negative_shape_hits", 0) > 0 and metrics.get("explicit_connection_hits", 0) == 0:
+        # In high-connection datasets, keep one bounded recovery path for names
+        # that still show meaningful person+institution overlap.
+        if not low_connection_profile:
+            has_overlap_signals = (
+                metrics.get("person_institution_hits", 0) >= 2
+                and metrics.get("max_relevance_score", 0) >= 12
+                and (
+                    metrics.get("purdue_domain_hits", 0) > 0
+                    or metrics.get("edu_hits", 0) > 0
+                )
+            )
+            if has_overlap_signals:
+                return True, "high_connection_negative_shape_recovery", subtype
         if not _has_historical_anchor_metrics(metrics):
             return False, "negative_shape_post_rescue", subtype
     if subtype == "borderline_likely_positive":
@@ -687,7 +736,11 @@ async def _run_staged_pre_llm_search(
         metadata["final_result_count"] = len(current_results)
         return current_results, decision, _finalize_with_timing(metadata)
 
-    should_escalate, enhanced_reason, borderline_subtype = should_attempt_validation_enhanced(name, decision)
+    should_escalate, enhanced_reason, borderline_subtype = should_attempt_validation_enhanced(
+        name,
+        decision,
+        dataset_profile=dataset_profile,
+    )
     metadata["enhanced_reason"] = enhanced_reason
     metadata["escalation_reason"] = enhanced_reason
     metadata["borderline_subtype"] = borderline_subtype
@@ -2158,7 +2211,7 @@ async def process_batch(names: List[str], use_enhanced_search: bool, debug: bool
         try:
             outcome = await search_with_semaphore(name)
             return name, outcome, None
-        except Exception as exc:
+        except BaseException as exc:
             return name, None, exc
 
     search_tasks = [asyncio.create_task(search_with_name(name)) for name in names]
@@ -2889,6 +2942,210 @@ async def run_pipeline(names: List[str], batch_size: int, use_enhanced_search: b
         print(f"[PIPELINE] All records processed successfully")
     
     return all_results
+
+
+async def expand_cluster_results_identity_safe(
+    df_clustered: pd.DataFrame,
+    cluster_reps: pd.DataFrame,
+    cluster_results: List[Dict[str, Any]],
+    *,
+    batch_size: int,
+    dataset_profile: Optional[str] = None,
+    fields_to_map: Optional[List[str]] = None,
+    debug: bool = False,
+) -> Tuple[pd.DataFrame, Dict[Any, Dict[str, Any]]]:
+    """Expand representative cluster results onto rows with identity-safe fallback.
+
+    For connected representative decisions, rows in the same cluster with a different
+    last name are re-checked individually before values are applied.
+    """
+    if "cluster_label" not in df_clustered.columns:
+        raise ValueError("df_clustered must contain 'cluster_label'")
+    if "name" not in df_clustered.columns:
+        raise ValueError("df_clustered must contain 'name'")
+    if "cluster_label" not in cluster_reps.columns or "representative_name" not in cluster_reps.columns:
+        raise ValueError("cluster_reps must contain 'cluster_label' and 'representative_name'")
+
+    effective_fields = list(fields_to_map) if fields_to_map else list(DEFAULT_CLUSTER_RESULT_FIELDS)
+    df_out = df_clustered.copy()
+
+    cluster_institution_map: Dict[Any, Dict[str, Any]] = {}
+    for cluster_label, rep_name, res in zip(
+        cluster_reps["cluster_label"],
+        cluster_reps["representative_name"],
+        cluster_results,
+    ):
+        if not isinstance(res, dict):
+            res = {"raw_result": res}
+
+        institution = res.get("institution", "")
+        verdict = res.get("verdict", "")
+        purdue_match = (
+            verdict == "connected"
+            and (
+                "purdue university" in str(institution).lower()
+                or (str(institution).lower().startswith("purdue") and "university" in str(institution).lower())
+            )
+        )
+        res["purdue_connection"] = purdue_match
+        cluster_institution_map[cluster_label] = res
+
+    for field in effective_fields:
+        df_out[field] = df_out["cluster_label"].map(
+            lambda x: cluster_institution_map.get(x, {}).get(field, None)
+        )
+
+    def _last_name(value: Any) -> str:
+        parts = [p for p in str(value).strip().split() if p]
+        return parts[-1].lower() if parts else ""
+
+    cluster_rep_name_map = dict(zip(cluster_reps["cluster_label"], cluster_reps["representative_name"]))
+
+    row_last = df_out["name"].map(_last_name)
+    rep_last = df_out["cluster_label"].map(lambda c: _last_name(cluster_rep_name_map.get(c, "")))
+    rep_connected = df_out["cluster_label"].map(
+        lambda c: cluster_institution_map.get(c, {}).get("verdict", "") == "connected"
+    )
+
+    fallback_mask = (
+        rep_connected
+        & row_last.ne("")
+        & rep_last.ne("")
+        & row_last.ne(rep_last)
+    )
+
+    fallback_names = sorted(set(
+        df_out.loc[fallback_mask, "name"].dropna().astype(str).str.strip().tolist()
+    ))
+
+    if fallback_names:
+        print(f"Identity safety fallback: re-checking {len(fallback_names)} name(s)")
+        fallback_batch_size = max(2, min(6, batch_size // 2 if batch_size > 1 else 2))
+        fallback_results = await run_pipeline(
+            fallback_names,
+            batch_size=fallback_batch_size,
+            use_enhanced_search=True,
+            dataset_profile=dataset_profile,
+            use_dynamic_batching=False,
+            debug=debug,
+        )
+        fallback_result_map = {
+            _normalize_name_key(name): res
+            for name, res in zip(fallback_names, fallback_results)
+            if isinstance(res, dict)
+        }
+
+        for field in effective_fields:
+            current_values = df_out.loc[fallback_mask, field]
+            replacement_values = df_out.loc[fallback_mask, "name"].map(
+                lambda n: fallback_result_map.get(_normalize_name_key(n), {}).get(field, None)
+            )
+            merged_values = replacement_values.where(replacement_values.notna(), current_values)
+            if field == "purdue_connection":
+                merged_values = merged_values.fillna(False).astype(bool)
+            df_out.loc[fallback_mask, field] = merged_values
+    else:
+        print("Identity safety fallback: no mismatched connected cluster rows detected")
+
+    return df_out, cluster_institution_map
+
+
+_RECOVERY_QUERY_TEMPLATES: List[str] = [
+    '"{name}" "Purdue University" (faculty OR professor OR president OR chancellor OR provost OR dean OR director OR executive OR alumni OR student OR degree OR visiting OR postdoc)',
+    'site:purdue.edu "{name}"',
+    '"{name}" "Purdue" "alumni"',
+    '"{name}" "Purdue" "professor"',
+    '"{name}" "Purdue" "president"',
+    '"{name}" "Purdue" "chancellor"',
+    '"{name}" "Purdue" "PhD"',
+]
+
+
+async def _recover_one_name_with_targeted_search(
+    name: str,
+    *,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    collected: List[Dict[str, Any]] = []
+
+    basic_results, _ = await validation_basic_search(name, INSTITUTION, debug=debug)
+    collected.extend(basic_results)
+
+    for template in _RECOVERY_QUERY_TEMPLATES:
+        query = template.format(name=name)
+        try:
+            extra, _ = await validation_search_query(
+                query,
+                institution=INSTITUTION,
+                person_name=name,
+                limit=12,
+                debug=debug,
+                prefer_backend="ddg",
+                allow_bing_fallback=True,
+                allow_slow_ddg_fallback=False,
+                ensure_tokens=False,
+            )
+            collected.extend(extra)
+        except Exception as exc:
+            if debug:
+                print(f"[RECOVERY] Query failed for {name}: {query} ({exc})")
+
+    try:
+        enhanced_results, _ = await validation_enhanced_search(name, INSTITUTION, debug=debug)
+        collected.extend(enhanced_results)
+    except Exception as exc:
+        if debug:
+            print(f"[RECOVERY] Enhanced search failed for {name}: {exc}")
+
+    merged_results = _dedupe_by_url(collected)[:40]
+
+    decision = await analyze_connection(
+        name,
+        INSTITUTION,
+        merged_results,
+        debug=debug,
+        max_retries=4,
+        per_attempt_timeout=35.0,
+    )
+    if not isinstance(decision, dict):
+        decision = _build_error("Recovery pass returned invalid decision")
+
+    decision["name"] = name
+    decision["institution"] = decision.get("institution") or INSTITUTION
+    decision["recovery_results_used"] = len(merged_results)
+    return decision
+
+
+async def run_targeted_recovery_pass(
+    names: List[str],
+    *,
+    max_concurrency: int = 4,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    """Run a generic high-recall recovery pass for provided names.
+
+    This does not use VIP bypass logic and applies the same search/LLM judgment
+    pattern to each name.
+    """
+    cleaned_names = [n for n in names if _safe_text(n).strip()]
+    if not cleaned_names:
+        return []
+
+    sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+
+    async def _wrapped(candidate: str) -> Dict[str, Any]:
+        async with sem:
+            try:
+                return await _recover_one_name_with_targeted_search(candidate, debug=debug)
+            except Exception as exc:
+                error_result = _build_error(f"Recovery pass failed: {exc}")
+                error_result["name"] = candidate
+                error_result["institution"] = INSTITUTION
+                error_result["recovery_results_used"] = 0
+                return error_result
+
+    tasks = [asyncio.create_task(_wrapped(name)) for name in cleaned_names]
+    return await asyncio.gather(*tasks)
 
 
 async def main_async(debug: bool, batch_size: int, use_enhanced_search: bool, input_path: str, inter_batch_delay: float) -> None:

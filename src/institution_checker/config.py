@@ -47,14 +47,18 @@ VIP_RESCUE_QUERIES = [
 # borderline (worth one cheap rescue query), or plausible enough to send to the LLM.
 PRE_LLM_SURVEY_ENABLED = True
 PRE_LLM_SURVEY_TRI_STATE = True
-PRE_LLM_SURVEY_VIP_BYPASS = True
+PRE_LLM_SURVEY_VIP_BYPASS = False
 PRE_LLM_SURVEY_HARD_NO_THRESHOLD = 2
 PRE_LLM_SURVEY_PLAUSIBLE_THRESHOLD = 12
 PRE_LLM_SURVEY_ENABLE_BORDERLINE_RESCUE = True
 PRE_LLM_SURVEY_RESCUE_NUM_RESULTS = 8
 PRE_LLM_SURVEY_RESCUE_QUERY_TEMPLATE = (
     'site:purdue.edu "{name}" '
-    '(professor OR faculty OR alumni OR student OR degree OR visiting OR postdoc OR researcher OR "summer program" OR "summer school")'
+    '('
+    'professor OR faculty OR alumni OR student OR degree OR visiting OR postdoc OR researcher '
+    'OR president OR chancellor OR provost OR dean OR director OR executive '
+    'OR "summer program" OR "summer school"'
+    ')'
 )
 
 # Safety: connected verdicts must come from LLM judgment, not heuristic auto-rescue.
