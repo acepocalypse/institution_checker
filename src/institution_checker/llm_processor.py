@@ -79,7 +79,7 @@ Use "current" when the language is present tense or references this year/{prior_
 
 CORRECTION RULES (apply if evidence matches):
 - If mentions "Nobel Prize" AND the institution name (implying affiliation/alumni status) → set connected=Y, type=Faculty or Alumni (High Confidence)
-- If mentions "professor", "faculty", "PhD from", "Distinguished Professor" → set connected=Y
+- If mentions "professor", "faculty", "PhD from", "Distinguished Professor" AND explicitly mentions {institution} (or an official institution domain/source) → set connected=Y
 - If mentions "honorary", "lecture", "speaker", "parents" → set connected=N
 - If mentions "Processing error" → mark verification_status=needs_review
 - If only LinkedIn/blog source → mark verification_status=needs_review
@@ -611,6 +611,56 @@ def _decision_mentions_target_person(
 
     for result in (results or [])[:10]:
         if _result_mentions_person_strict(result, name_tokens):
+            return True
+
+    return False
+
+
+def _decision_mentions_target_institution(
+    decision: Dict[str, str],
+    institution: str,
+    results: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Verify connected evidence is explicitly tied to the target institution."""
+    aliases = _institution_aliases(institution)
+    guess_domain = _institution_domain_guess(institution)
+    if not aliases and not guess_domain:
+        return True
+
+    alias_pattern = re.compile("|".join(re.escape(alias) for alias in aliases), re.IGNORECASE) if aliases else None
+
+    detail = _safe_text(decision.get("verification_detail"))
+    summary = _safe_text(decision.get("summary"))
+    primary_source = _safe_text(decision.get("primary_source") or decision.get("supporting_url"))
+    decision_text = _normalize_simple(f"{detail} {summary} {primary_source}")
+
+    if alias_pattern and alias_pattern.search(decision_text):
+        return True
+
+    if primary_source:
+        domain = urlparse(primary_source).netloc.lower()
+        if guess_domain and guess_domain in domain:
+            return True
+        if alias_pattern and alias_pattern.search(domain):
+            return True
+
+    # Fallback: require at least one supporting result that mentions both person and institution.
+    for result in (results or [])[:20]:
+        signals = result.get("signals") or {}
+        if not signals.get("has_person_name"):
+            continue
+
+        if signals.get("has_institution"):
+            return True
+
+        url = _safe_text(result.get("url"))
+        domain = urlparse(url).netloc.lower() if url else ""
+        text = _normalize_simple(_result_combined_text(result))
+        if alias_pattern and alias_pattern.search(text):
+            return True
+        if guess_domain and guess_domain in domain:
+            return True
+        if alias_pattern and alias_pattern.search(domain):
             return True
 
     return False
@@ -2040,6 +2090,8 @@ def _validate_decision(
         if relationship_timeframe not in {"current", "past", "unknown"}:
             return False
         if not _decision_mentions_target_person(decision, name, results):
+            return False
+        if not _decision_mentions_target_institution(decision, institution, results):
             return False
     else:
         if relationship_timeframe not in {"unknown"}:
